@@ -1,4 +1,4 @@
-# CapstoneDesign_6_Encore
+# CapstoneDesign_6
 
 # 🔍 Hybrid RAG System
 
@@ -137,4 +137,4 @@ python main.py
 ## 🤝 협력 기관
 
 **엔코아(En-Core)**  
-멘토: 왕태웅 책임매니저 (twwang@en-core.com)
+멘토: 왕태웅 책임매니저 (twwang@gmail.com)
