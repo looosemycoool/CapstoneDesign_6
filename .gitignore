@@ -1,0 +1,31 @@
+# 환경변수 (API 키 포함 — 절대 올리지 마세요)
+.env
+
+# 가상환경
+venv/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Chroma Vector DB (로컬 생성 파일 — 용량 큼)
+chroma_db/
+
+# 파싱/크롤링 결과 (로컬에서 재생성 가능)
+data/parsed/
+data/raw/
+data/attachments/
+data/tmp_convert/
+
+# 평가 결과 (xlsx, json 결과 파일)
+evaluation/results/
+
+# 로그
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
