@@ -158,8 +158,17 @@ def chunk_documents(documents):
     return chunks
 
 
+def get_existing_file_names(collection) -> set:
+    """컬렉션에 이미 저장된 file_name 목록 반환"""
+    try:
+        result = collection.get(include=["metadatas"])
+        return {m.get("file_name", "") for m in result.get("metadatas", []) if m.get("file_name")}
+    except Exception:
+        return set()
+
+
 def build_vector_db(experiment, chunks, force_rebuild=False):
-    """실험 조합 하나에 대해 Vector DB 구축"""
+    """실험 조합 하나에 대해 Vector DB 구축 (중복 문서 자동 스킵)"""
     exp_id = experiment["id"]
     collection_name = f"knu_cse_{exp_id}"
 
@@ -167,28 +176,50 @@ def build_vector_db(experiment, chunks, force_rebuild=False):
     existing_collections = client.list_collections()  # chromadb 0.6.x에서는 이름 리스트 반환
 
     if collection_name in existing_collections:
-        if not force_rebuild:
-            print(f"  [스킵] 이미 존재: {collection_name}")
-            return
+        if force_rebuild:
+            client.delete_collection(collection_name)
+            print(f"  [초기화] 기존 컬렉션 삭제: {collection_name}")
+            collection = client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            already_embedded = set()
+        else:
+            # 기존 컬렉션 유지 — 이미 임베딩된 파일은 스킵
+            collection = client.get_collection(collection_name)
+            already_embedded = get_existing_file_names(collection)
+            if already_embedded:
+                print(f"  [중복 감지] 이미 임베딩된 파일 {len(already_embedded)}개 → 해당 청크 스킵")
+    else:
+        collection = client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        already_embedded = set()
 
-        client.delete_collection(collection_name)
-        print(f"  [초기화] 기존 컬렉션 삭제: {collection_name}")
+    # 이미 임베딩된 파일의 청크 제외
+    new_chunks = [c for c in chunks if c["metadata"].get("file_name", "") not in already_embedded]
 
-    collection = client.create_collection(
-        name=collection_name,
-        metadata={"hnsw:space": "cosine"}
-    )
+    if not new_chunks:
+        print(f"  [스킵] 추가할 새 청크 없음 (전체 {len(chunks)}개 이미 존재)")
+        return
+
+    skipped = len(chunks) - len(new_chunks)
+    if skipped:
+        print(f"  [스킵] {skipped}개 청크 제외 (중복 파일) → {len(new_chunks)}개 신규 청크 임베딩")
 
     embedding_fn = get_embedding_function(experiment)
 
+    # 기존 ID와 충돌 방지를 위해 현재 컬렉션 크기 기준으로 오프셋 계산
+    id_offset = collection.count()
     batch_size = 50
-    total = len(chunks)
+    total = len(new_chunks)
 
     for i in range(0, total, batch_size):
-        batch = chunks[i:i + batch_size]
+        batch = new_chunks[i:i + batch_size]
         texts = [c["text"] for c in batch]
         metadatas = [c["metadata"] for c in batch]
-        ids = [f"{exp_id}_chunk_{i + j}" for j in range(len(batch))]
+        ids = [f"{exp_id}_chunk_{id_offset + i + j}" for j in range(len(batch))]
 
         embeddings = embedding_fn.embed_documents(texts)
         collection.add(
@@ -199,7 +230,7 @@ def build_vector_db(experiment, chunks, force_rebuild=False):
         )
         print(f"  [{min(i + batch_size, total)}/{total}] 저장 완료")
 
-    print(f"  [완료] {collection_name} → {collection.count()}개 청크")
+    print(f"  [완료] {collection_name} → 총 {collection.count()}개 청크")
 
 
 def build_all(force_rebuild=False):
