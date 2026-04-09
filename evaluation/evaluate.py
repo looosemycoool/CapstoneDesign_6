@@ -6,6 +6,170 @@ import importlib.util
 from datetime import datetime
 
 import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# ── 깔끔한 xlsx 저장 ──────────────────────────────────────
+def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp):
+    """
+    시트 구성:
+      ① 요약  : 모델 정보 + Excel 수식 자동 집계
+      ② 결과  : 핵심 11열, 성공/실패 색상, 헤더 freeze
+    """
+    # ── 색상 / 폰트 ──────────────────────────────────────
+    BLUE_FILL    = PatternFill("solid", fgColor="1F497D")
+    TEAL_FILL    = PatternFill("solid", fgColor="17375E")
+    SUCCESS_FILL = PatternFill("solid", fgColor="E2EFDA")
+    FAIL_FILL    = PatternFill("solid", fgColor="FFDDC1")
+    Q_FILL       = PatternFill("solid", fgColor="F5F5F5")
+    H_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=9)
+    B_FONT  = Font(bold=True, name="Arial", size=9)
+    N_FONT  = Font(name="Arial", size=9)
+    AL_C    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    AL_TL   = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
+    AL_TC   = Alignment(horizontal="center", vertical="top")
+
+    n = len(rows)  # 질문 수
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # ── ① 요약 시트 ──────────────────────────────────────
+    ws1 = wb.create_sheet("① 요약")
+
+    def label_row(ws, row, label, value, label_fill=None):
+        lc = ws.cell(row=row, column=1, value=label)
+        vc = ws.cell(row=row, column=2, value=value)
+        lc.font = B_FONT
+        vc.font = N_FONT
+        lc.alignment = AL_C
+        vc.alignment = AL_TL
+        if label_fill:
+            lc.fill = label_fill
+            lc.font = H_FONT
+
+    # 모델 정보 블록
+    ws1.merge_cells("A1:B1")
+    title = ws1["A1"]
+    title.value = "📊 평가 결과 요약"
+    title.font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    title.fill = TEAL_FILL
+    title.alignment = AL_C
+    ws1.row_dimensions[1].height = 28
+
+    info = [
+        ("실험 ID",       experiment_id),
+        ("벡터 컬렉션",   collection_name),
+        ("총 질문 수",    n),
+        ("평가 일시",     timestamp),
+        ("소요 시간(초)", elapsed),
+    ]
+    for i, (label, val) in enumerate(info, start=2):
+        label_row(ws1, i, label, val)
+
+    # 구분선
+    ws1.merge_cells("A8:B8")
+    ws1["A8"].value = "📈 성능 지표"
+    ws1["A8"].font = H_FONT
+    ws1["A8"].fill = BLUE_FILL
+    ws1["A8"].alignment = AL_C
+    ws1.row_dimensions[8].height = 22
+
+    # 수식으로 자동 집계 (결과 시트 참조)
+    result_sheet = "② 결과"
+    metrics = [
+        ("Vector 성공 수",    f"=COUNTIF('② 결과'!E2:E{n+1},\"성공\")"),
+        ("Vector 성공률",     f"=COUNTIF('② 결과'!E2:E{n+1},\"성공\")/COUNTA('② 결과'!E2:E{n+1})"),
+        ("Hybrid 성공 수",    f"=COUNTIF('② 결과'!H2:H{n+1},\"성공\")"),
+        ("Hybrid 성공률",     f"=COUNTIF('② 결과'!H2:H{n+1},\"성공\")/COUNTA('② 결과'!H2:H{n+1})"),
+        ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!J2:J{n+1})"),
+    ]
+    for i, (label, formula) in enumerate(metrics, start=9):
+        lc = ws1.cell(row=i, column=1, value=label)
+        vc = ws1.cell(row=i, column=2, value=formula)
+        lc.font = B_FONT
+        lc.alignment = AL_C
+        vc.font = N_FONT
+        vc.alignment = AL_TC
+        # 성공률 셀은 퍼센트 형식
+        if "성공률" in label:
+            vc.number_format = "0.0%"
+        elif "평균" in label:
+            vc.number_format = "0.00"
+
+    # 테두리
+    thin = Side(style="thin", color="CCCCCC")
+    for row in ws1.iter_rows(min_row=1, max_row=13, min_col=1, max_col=2):
+        for cell in row:
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws1.column_dimensions["A"].width = 20
+    ws1.column_dimensions["B"].width = 30
+
+    # ── ② 결과 시트 ──────────────────────────────────────
+    ws2 = wb.create_sheet("② 결과")
+
+    headers = [
+        "번호", "분류", "질문", "정답",
+        "Vector 성공", "Vector 답변", "Vector 오류",
+        "Hybrid 성공", "Hybrid 답변", "Graph 수", "Hybrid 오류",
+    ]
+    col_widths = [6, 10, 42, 32, 10, 42, 20, 10, 42, 8, 20]
+    SUCCESS_COLS = {5, 8}   # Vector 성공, Hybrid 성공 (1-based)
+
+    # 헤더
+    for col_idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
+        cell = ws2.cell(row=1, column=col_idx, value=h)
+        cell.font      = H_FONT
+        cell.fill      = BLUE_FILL
+        cell.alignment = AL_C
+        ws2.column_dimensions[get_column_letter(col_idx)].width = w
+    ws2.row_dimensions[1].height = 30
+
+    # 데이터
+    for idx, r in enumerate(rows, start=2):
+        # boolean → 문자열 변환
+        v_ok = r.get("vector_success")
+        h_ok = r.get("hybrid_success")
+        v_str = "성공" if v_ok is True or v_ok == "성공" else "실패"
+        h_str = "성공" if h_ok is True or h_ok == "성공" else "실패"
+
+        data = [
+            r.get("id", ""),
+            r.get("category", ""),
+            r.get("question", ""),
+            r.get("ground_truth", ""),
+            v_str,
+            r.get("vector_answer", ""),
+            r.get("vector_error", ""),
+            h_str,
+            r.get("hybrid_answer", ""),
+            r.get("hybrid_graph_count", 0),
+            r.get("hybrid_error", ""),
+        ]
+
+        for col_idx, val in enumerate(data, start=1):
+            cell = ws2.cell(row=idx, column=col_idx, value=val)
+            cell.font = N_FONT
+
+            if col_idx in SUCCESS_COLS:
+                cell.fill      = SUCCESS_FILL if val == "성공" else FAIL_FILL
+                cell.alignment = AL_TC
+            elif col_idx == 3:  # 질문 열 배경
+                cell.fill      = Q_FILL
+                cell.alignment = AL_TL
+            elif col_idx == 10:  # Graph 수
+                cell.alignment = AL_TC
+            else:
+                cell.alignment = AL_TL
+
+        ws2.row_dimensions[idx].height = 15
+
+    ws2.freeze_panes = "E2"  # 질문까지 고정, 성공/실패부터 스크롤
+
+    wb.save(xlsx_path)
 
 
 # ── 경로 설정 ─────────────────────────────────────────────
@@ -253,20 +417,7 @@ def run_evaluation():
     df = pd.DataFrame(rows)
 
     # 엑셀 저장
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="results")
-
-        summary_df = pd.DataFrame([{
-            "timestamp": timestamp,
-            "total_questions": len(rows),
-            "vector_success_count": int(df["vector_success"].sum()) if not df.empty else 0,
-            "hybrid_success_count": int(df["hybrid_success"].sum()) if not df.empty else 0,
-            "avg_hybrid_graph_count": round(df["hybrid_graph_count"].mean(), 2) if not df.empty else 0,
-            "collection_name": collection_name,
-            "experiment_id": experiment_id,
-            "elapsed_seconds": elapsed,
-        }])
-        summary_df.to_excel(writer, index=False, sheet_name="summary")
+    _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp)
 
     # 원본 json 저장
     with open(json_path, "w", encoding="utf-8") as f:

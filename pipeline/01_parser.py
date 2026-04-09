@@ -14,6 +14,7 @@ PARSED_DIR = os.path.join(BASE_DIR, "data", "parsed")
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 TMP_DIR = os.path.join(BASE_DIR, "data", "tmp_convert")
 LIBREOFFICE = r"C:\Program Files\LibreOffice\program\soffice.exe"
+# 한글 to pdf 변환 라이브러리 사용 (반영필요)
 
 os.makedirs(PARSED_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
