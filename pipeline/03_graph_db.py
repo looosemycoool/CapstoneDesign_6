@@ -88,6 +88,7 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 - 스키마를 고정하지 말고, 문서 내용에서 자연스럽게 나타나는 개념을 개체 타입으로 사용하세요.
 - 개체 타입은 짧고 명확한 영문 명사로 작성하세요 (예: Scholarship, GraduationRequirement, Course, Deadline, Department, Program, Student, Condition, Schedule, Rule).
 - 비슷한 의미의 개체는 하나로 통합하세요 (예: "졸업요건"과 "졸업 요건"은 동일 개체).
+- 날짜, 금액, URL, 자격 요건, 학점 등 세부적인 정보는 새로운 노드로 쪼개지 마세요. 반드시 관련 핵심 개체의 'properties' 목록에 key-value 형태로 깔끔하게 저장하세요.
 - 관계 타입은 동사 형태의 영문 대문자로 작성하세요 (예: REQUIRES, HAS_DEADLINE, PART_OF, APPLIES_TO, RELATED_TO, HAS_CONDITION, BELONGS_TO, OFFERS, TARGETS).
 - name이 비어 있는 개체는 만들지 마세요.
 - 확실하지 않은 관계는 억지로 만들지 마세요.
@@ -218,15 +219,30 @@ def create_document_node(session, file_name: str):
     """, {"file_name": file_name})
 
 
-def upsert_entity(session, name: str, etype: str, props: dict) -> str | None:
+def upsert_entity(session, name: str, etype: str, props) -> str | None:
     name = str(name).strip()
     if not name:
         return None
 
     label = sanitize_label(etype or "Entity")
-
     safe_props = {}
-    for k, v in (props or {}).items():
+
+    if isinstance(props, dict):
+        raw_items = props.items()
+    elif isinstance(props, list):
+        raw_items = []
+        for item in props:
+            if isinstance(item, dict):
+                # {"key": "amount", "value": "100"} 형태인 경우
+                if "key" in item and "value" in item:
+                    raw_items.append((item["key"], item["value"]))
+                # {"amount": "100"} 형태가 리스트에 들어있는 경우
+                else:
+                    raw_items.extend(item.items())
+    else:
+        raw_items = []
+
+    for k, v in raw_items:
         if not k:
             continue
         key = re.sub(r"[^\w]", "_", str(k), flags=re.UNICODE).strip("_")
