@@ -93,6 +93,17 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 - 확실하지 않은 관계는 억지로 만들지 마세요.
 - relation의 from·to는 반드시 entities의 name 중 하나여야 합니다.
 
+[Few-shot 예시]
+문서: "2026학년도 소프트웨어융합전공 산학프로젝트(3학점) 결과보고서 제출 안내. 기한은 6월 15일까지이며, 우수팀에게는 SW교육원에서 50만원의 장학금을 지급합니다."
+추출 논리:
+- Entity 1: name="소프트웨어융합전공", type="Major"
+- Entity 2: name="산학프로젝트", type="Course", properties=[(key="credits", value="3학점"), (key="deadline", value="6월 15일")]
+- Entity 3: name="SW교육원", type="Organization"
+- Entity 4: name="우수팀 장학금", type="Funding", properties=[(key="amount", value="50만원")]
+- Relation 1: from="소프트웨어융합전공", to="산학프로젝트", type="REQUIRES"
+- Relation 2: from="SW교육원", to="우수팀 장학금", type="PROVIDES"
+- Relation 3: from="우수팀 장학금", to="산학프로젝트", type="REWARDS"
+
 반드시 아래 JSON 형식으로만 응답하세요. 설명 없이 JSON만 출력하세요.
 
 {{
@@ -364,11 +375,11 @@ def search_graph(keyword: str):
         result = session.run("""
             MATCH (n)-[r]->(m)
             WHERE coalesce(n.name, '') CONTAINS $keyword
-               OR coalesce(n.title, '') CONTAINS $keyword
-               OR coalesce(n.file_name, '') CONTAINS $keyword
-               OR coalesce(m.name, '') CONTAINS $keyword
-               OR coalesce(m.title, '') CONTAINS $keyword
-               OR coalesce(m.file_name, '') CONTAINS $keyword
+                OR coalesce(n.title, '') CONTAINS $keyword
+                OR coalesce(n.file_name, '') CONTAINS $keyword
+                OR coalesce(m.name, '') CONTAINS $keyword
+                OR coalesce(m.title, '') CONTAINS $keyword
+                OR coalesce(m.file_name, '') CONTAINS $keyword
             RETURN
                 coalesce(n.name, n.title, n.file_name, '') AS from_node,
                 type(r) AS rel,
