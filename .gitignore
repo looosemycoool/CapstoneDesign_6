@@ -3,6 +3,7 @@
 
 # 가상환경
 venv/
+.venv/
 
 # Python 캐시
 __pycache__/

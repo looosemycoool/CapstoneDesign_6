@@ -32,6 +32,31 @@ def clear_db(driver):
     print("[초기화] 기존 그래프 삭제 완료")
 
 
+# ── 약어/동의어 사전 ──────────────────────────────────────
+ALIAS_MAP = {
+    "글솝": "글로벌소프트웨어융합전공",
+    "글로벌소프트웨어": "글로벌소프트웨어융합전공",
+    "다전공": "다전공프로그램",
+    "부전공": "부전공프로그램",
+    "조기졸업": "조기졸업요건",
+    "조기 졸업": "조기졸업요건",
+}
+
+
+def normalize_node_name(text: str) -> str:
+    """노드 이름 정규화
+    - 앞뒤 공백 제거
+    - 괄호 안 내용 제거 (예: 졸업요건(일반) → 졸업요건)
+    - 내부 공백 제거 (표기 불일치 방지)
+    - 약어/동의어 통일
+    """
+    text = text.strip()
+    text = re.sub(r"\(.*?\)", "", text).strip()   # 괄호 제거
+    text = re.sub(r"\s+", "", text)               # 내부 공백 제거
+    text = ALIAS_MAP.get(text, text)              # alias 적용
+    return text if text else "Unknown"
+
+
 # ── 문자열 정제 ───────────────────────────────────────────
 def sanitize_label(label: str) -> str:
     """Neo4j 노드 라벨로 사용 가능한 형태로 정제 (알파벳/숫자/언더스코어만)"""
@@ -72,7 +97,6 @@ def safe_json_load(text: str):
     if start != -1 and end != -1 and start < end:
         text = text[start:end + 1]
     return json.loads(text)
-
 
 # ── Step 1: 개체·관계 자동 추출 (GPT-4o-mini, 동적 스키마) ──────
 def extract_entities_and_relations(file_name: str, text: str) -> dict:
@@ -187,12 +211,19 @@ def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
 
         mapping = json.loads(text)
 
-        # 누락된 노드는 자기 자신으로 매핑
-        for name in all_node_names:
-            if name not in mapping:
-                mapping[name] = name
+        normalized_mapping = {}
+        for src, dst in mapping.items():
+            src_norm = normalize_node_name(str(src))
+            dst_norm = normalize_node_name(str(dst))
+            if src_norm and src_norm != "Unknown" and dst_norm and dst_norm != "Unknown":
+                normalized_mapping[src_norm] = dst_norm
 
-        return mapping
+        for name in all_node_names:
+            name_norm = normalize_node_name(str(name))
+            if name_norm not in normalized_mapping:
+                normalized_mapping[name_norm] = name_norm
+
+        return normalized_mapping
 
     except Exception as e:
         print(f"  [노드 통합 오류] {e}")
@@ -208,8 +239,8 @@ def create_document_node(session, file_name: str):
 
 
 def upsert_entity(session, name: str, etype: str, props: dict) -> str | None:
-    name = str(name).strip()
-    if not name:
+    name = normalize_node_name(str(name))
+    if not name or name == "Unknown":
         return None
 
     label = sanitize_label(etype or "Entity")
@@ -223,7 +254,11 @@ def upsert_entity(session, name: str, etype: str, props: dict) -> str | None:
             safe_props[key] = "" if v is None else str(v)
 
     session.run(
-        f"MERGE (e:`{label}` {{name: $name}}) SET e += $props",
+        f"""
+        MERGE (e {{name: $name}})
+        SET e += $props
+        SET e:`{label}`
+        """,
         {"name": name, "props": safe_props}
     )
     return name
@@ -283,8 +318,8 @@ def build_graph():
 
         # 개체 이름 수집 (노드 통합 단계에서 사용)
         for ent in extracted.get("entities", []):
-            name = str(ent.get("name", "")).strip()
-            if name:
+            name = normalize_node_name(str(ent.get("name", "")))
+            if name and name != "Unknown":
                 all_entity_names.append(name)
 
     # ── 2단계: 전체 노드 이름 중복 제거 후 유사 노드 통합 ──
@@ -309,13 +344,15 @@ def build_graph():
 
             valid_names = set()
 
-            for entity in extracted.get("entities", []):
-                raw_name = str(entity.get("name", "")).strip()
-                if not raw_name:
+            for ent in extracted.get("entities", []):
+                raw_name = normalize_node_name(str(ent.get("name", "")))
+                if not raw_name or raw_name == "Unknown":
                     continue
                 # 통합된 대표 이름으로 교체
-                canonical = name_mapping.get(raw_name, raw_name)
-                created = upsert_entity(session, canonical, entity.get("type", "Entity"), entity.get("properties", {}))
+                canonical = normalize_node_name(name_mapping.get(raw_name, raw_name))
+                if not canonical or canonical == "Unknown":
+                    continue
+                created = upsert_entity(session, canonical, ent.get("type", "Entity"), ent.get("properties", {}))
                 if created:
                     valid_names.add(canonical)
 
@@ -326,15 +363,17 @@ def build_graph():
                     """, {"file_name": file_name, "name": canonical})
 
             for rel in extracted.get("relations", []):
-                from_raw = str(rel.get("from", "")).strip()
-                to_raw   = str(rel.get("to", "")).strip()
+                from_raw = normalize_node_name(str(rel.get("from", "")))
+                to_raw   = normalize_node_name(str(rel.get("to", "")))
                 rel_type = rel.get("type", "RELATED_TO")
 
-                if not from_raw or not to_raw:
+                if not from_raw or from_raw == "Unknown":
+                    continue
+                if not to_raw or to_raw == "Unknown":
                     continue
 
-                from_name = name_mapping.get(from_raw, from_raw)
-                to_name   = name_mapping.get(to_raw, to_raw)
+                from_name = normalize_node_name(name_mapping.get(from_raw, from_raw))
+                to_name   = normalize_node_name(name_mapping.get(to_raw, to_raw))
 
                 if from_name not in valid_names or to_name not in valid_names:
                     continue
@@ -382,12 +421,34 @@ def search_graph(keyword: str):
                 print(f"  {row.get('from_node', '')} --[{row.get('rel', '')}]--> {row.get('to_node', '')}")
         else:
             print("  결과 없음")
-
     driver.close()
+
+def check_duplicate_nodes():
+    driver = get_driver()
+    print("\n[중복 노드 검사]")
+    with driver.session() as session:
+        rows = session.run("""
+            MATCH (n)
+            WITH n.name AS name, count(*) AS cnt
+            WHERE name IS NOT NULL AND cnt > 1
+            RETURN name, cnt
+            ORDER BY cnt DESC
+            LIMIT 20
+        """).data()
+
+        if rows:
+            print("중복 노드 발견:")
+            for row in rows:
+                print(f"  {row['name']}: {row['cnt']}개")
+        else:
+            print("동일 name 기준 중복 노드 없음")
+    driver.close()
+
 
 
 if __name__ == "__main__":
     build_graph()
+    check_duplicate_nodes() 
     search_graph("졸업")
     search_graph("장학")
     search_graph("교과목")
