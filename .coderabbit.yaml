@@ -1,0 +1,187 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# CodeRabbit 설정 파일 — CapstoneDesign_6 (Hybrid RAG Chatbot)
+# 경북대 컴퓨터학부 공지사항 Q&A 시스템 (Vector DB + Graph DB)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 리뷰 언어: 한국어
+language: "ko-KR"
+
+# ── 코드 리뷰 설정 ────────────────────────────────────────────────────────────
+reviews:
+  # 리뷰 강도: "assertive"(엄격, 변경 요청 포함) / "chill"(권고 중심)
+  profile: "chill"
+
+  # PR 전체 요약 자동 생성
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai 요약"
+
+  # 시 생성 비활성화 (학술 프로젝트)
+  poem: false
+
+  # 리뷰 상태 배지 표시
+  review_status: true
+
+  # walkthrough 기본 펼침
+  collapse_walkthrough: false
+
+  # 자동 리뷰 설정
+  auto_review:
+    enabled: true
+    # 드래프트 PR은 리뷰 제외
+    drafts: false
+    # 아래 브랜치로 들어오는 PR에 자동 리뷰 적용
+    base_branches:
+      - "main"
+      - "seoyeon/.*"
+      - "hyerim/.*"
+      - "siyeon/.*"
+
+  # ── 제외 경로 ─────────────────────────────────────────────────────────────
+  # 자동 생성 / 바이너리 / 로컬 전용 파일은 리뷰에서 제외
+  path_filters:
+    - "!venv/**"
+    - "!.venv/**"
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+    - "!**/*.pyo"
+    - "!chroma_db/**"
+    - "!data/raw/**"
+    - "!data/parsed/**"
+    - "!data/attachments/**"
+    - "!data/tmp_convert/**"
+    - "!data/tmp_zip/**"
+    - "!evaluation/results/**"
+    - "!**/*.log"
+    - "!**/.DS_Store"
+    - "!**/Thumbs.db"
+
+  # ── 전체 공통 지침 ────────────────────────────────────────────────────────
+  instructions: |
+    이 프로젝트는 경북대학교 컴퓨터학부 공지사항을 대상으로 한
+    Python 기반 Hybrid RAG(벡터 + 그래프) 챗봇 시스템입니다.
+    코드 리뷰 시 아래 원칙을 공통 적용해주세요:
+
+    1. 보안: API 키(OpenAI, Gemini, Upstage), Neo4j 비밀번호가
+       코드에 하드코딩되지 않고 반드시 .env에서만 로드되는지 확인합니다.
+
+    2. 예외 처리: 외부 API 호출(OpenAI, Gemini, Upstage, Neo4j, Chroma)과
+       파일 I/O는 개별 try-except로 처리하고, 오류 발생 시 전체 파이프라인이
+       중단되지 않도록 graceful한 처리가 되어 있는지 확인합니다.
+
+    3. 리소스 관리: Neo4j 드라이버, 파일 핸들, 임시 디렉토리 등은
+       사용 후 반드시 close/cleanup 되어야 합니다.
+
+    4. 한국어 친화성: 청킹, 키워드 추출 등 텍스트 처리 로직이
+       한국어 문서 특성(조사, 띄어쓰기 등)을 고려하고 있는지 의견을 제시합니다.
+
+    5. 재현 가능성: 실험 결과가 동일한 환경에서 재현 가능한지
+       (랜덤 시드, 모델 버전, 파라미터 고정 여부) 확인합니다.
+
+  # ── 경로별 세부 리뷰 지침 ─────────────────────────────────────────────────
+  path_instructions:
+
+    - path: "pipeline/00_crawler.py"
+      instructions: |
+        공지사항 크롤러입니다. 추가로 확인할 사항:
+        - requests 타임아웃(timeout=10, 30)이 모든 호출에 일관 적용되는지
+        - time.sleep으로 크롤링 속도 제한이 적절히 설정되어 있는지 (서버 부하 방지)
+        - 첨부파일 다운로드 시 파일명에 경로 구분자가 포함된 경우(path traversal) 방어가 있는지
+        - 페이지 수(max_pages) 설정이 전체 공지사항 수를 커버하는지 확인 의견 제시
+        - HTML 구조 변경 시 셀렉터가 깨지지 않도록 방어적으로 작성되었는지
+
+    - path: "pipeline/01_parser.py"
+      instructions: |
+        다형식 문서 파서입니다. 추가로 확인할 사항:
+        - LibreOffice subprocess 호출 후 tmp_convert 임시 파일이 항상 정리되는지
+        - ZIP 해제 시 zip slip 취약점(경로 탈출 공격) 방어 코드가 있는지
+          예: os.path.realpath로 추출 경로가 tmp_zip_dir 내부인지 검증
+        - pdfplumber 표 추출에서 None 셀 처리가 일관적인지
+        - HWP 변환 실패 시 빈 문자열 반환이 downstream에서 올바르게 처리되는지
+        - parse_zip 내부에서 tmp_zip_dir가 finally 블록에서 항상 삭제되는지
+
+    - path: "pipeline/02_vector_db.py"
+      instructions: |
+        6개 실험 조합의 ChromaDB 구축 스크립트입니다. 추가로 확인할 사항:
+        - get_embedding_function에서 API 키 누락 시 ValueError가 명확히 발생하는지
+        - 배치 처리(batch_size=50) 중 임베딩 API 오류 시 부분 저장 및 재시도 로직이 있는지
+        - chunk_size=500 / overlap=100이 한국어 문서에 적합한지 의견 제시
+          (영어 기준 설계된 경우 한국어 토큰 비율 차이로 실제 의미 단위와 불일치 가능)
+        - force_rebuild=False 기본값이 의도치 않은 중복 임베딩을 방지하는지
+        - 6개 컬렉션 구축 중 일부 실패 시 나머지는 계속 진행되는지
+
+    - path: "pipeline/03_graph_db.py"
+      instructions: |
+        GPT-4o-mini 기반 지식 그래프 구축 스크립트입니다. 추가로 확인할 사항:
+        - Cypher 쿼리의 라벨/관계 타입이 f-string으로 삽입되는 부분에서
+          sanitize_label / sanitize_relation_type 이 반드시 적용되는지 (인젝션 방지)
+        - BATCH=80 기준 노드 이름 목록이 GPT 토큰 한도(4096 tokens)를 초과하지 않는지
+        - 문서 텍스트를 3000자로 truncate하는 것이 정보 손실로 이어질 수 있음을 의견으로 제시
+        - consolidate_nodes 결과에서 매핑 누락된 노드가 자기 자신으로 fallback되는지
+        - Neo4j 드라이버가 build_graph와 search_graph 모두에서 finally/close() 처리되는지
+
+    - path: "pipeline/04_hybrid_rag.py"
+      instructions: |
+        핵심 Hybrid RAG 파이프라인입니다. 추가로 확인할 사항:
+        - vector_search와 graph_search가 독립적으로 오류 처리되는지
+          (한쪽 실패 시 나머지 결과만으로 답변 생성이 가능한지)
+        - extract_keywords의 불용어 목록이 한국어 실제 사용 패턴을 충분히 커버하는지
+          형태소 분석기(예: konlpy, kiwi) 미사용의 한계도 의견으로 제시
+        - generate_answer 프롬프트가 hallucination 억제에 충분한지
+          ("검색 결과에 없는 내용은 답변하지 않는다" 조건의 실효성)
+        - COLLECTION_NAME = "knu_cse_openai_small" 하드코딩이 의도된 것인지,
+          실험 전환 시 변경이 누락될 위험이 있는지 지적
+        - Neo4j 드라이버가 graph_search 완료 후 항상 close()되는지
+
+    - path: "evaluation/evaluate.py"
+      instructions: |
+        단일 모델 평가 스크립트입니다. 추가로 확인할 사항:
+        - evaluate_one에서 vector/hybrid 각각의 예외가 독립 처리되어
+          하나가 실패해도 나머지 결과는 기록되는지
+        - "성공" 판정이 단순 예외 미발생 여부만으로 결정되는 한계를 의견으로 제시
+          (정답 문자열 일치 또는 LLM 기반 정답 평가가 없는 점)
+        - xlsx 파일명에 타임스탬프가 포함되어 중복 덮어쓰기가 방지되는지
+        - truncate_text(limit=1500)가 평가에 필요한 충분한 컨텍스트를 보존하는지
+
+    - path: "evaluation/evaluate_all_models.py"
+      instructions: |
+        6개 모델 전체 비교 평가 스크립트입니다. 추가로 확인할 사항:
+        - 지수 백오프(MAX_RETRIES=3, RETRY_BACKOFF=2.0) 재시도 로직이
+          모든 API 제공자(OpenAI, Gemini, Upstage)에 일관 적용되는지
+        - 체크포인트 저장이 실험 단위로 작동하여 중단 후 재시작 시 중복 실행이 방지되는지
+        - 6 x N 규모의 API 호출에서 비용 및 Rate Limit 관리 방안이 있는지 의견 제시
+        - 결과 xlsx에서 6개 실험 간 공정한 비교를 위해 동일한 질문 순서가 보장되는지
+
+    - path: "requirements.txt"
+      instructions: |
+        - 버전이 == 으로 고정되어 재현 가능한 환경을 보장하는지
+        - 실제 코드에서 사용하지 않는 패키지(예: anthropic)가 포함되지 않았는지 확인
+        - 보안 취약점이 알려진 버전이 없는지 (pip-audit 결과 기준)
+
+    - path: "docker-compose.yml"
+      instructions: |
+        - Neo4j 기본 비밀번호 대신 환경변수로 주입하는지
+        - 포트 노출(7474, 7687)이 로컬 개발 전용으로 제한되는지
+        - 볼륨 마운트 경로가 올바르게 지정되어 데이터 영속성이 보장되는지
+
+    - path: ".env"
+      instructions: |
+        이 파일은 절대 커밋되어서는 안 됩니다.
+        .gitignore에 .env가 포함되어 있는지 확인하고,
+        코드 어느 곳에도 API 키가 직접 노출되지 않는지 전체 검토해주세요.
+
+# ── 정적 분석 도구 ─────────────────────────────────────────────────────────
+tools:
+  # Python 린터 / 포매터 (flake8 대체, 빠름)
+  ruff:
+    enabled: true
+  # 보안 취약점 스캐너 (하드코딩 키, 위험한 함수 사용 등 탐지)
+  bandit:
+    enabled: true
+  # 타입 체커 — 현재 타입 힌트 커버리지 낮으므로 비활성화, 추후 활성화 권장
+  mypy:
+    enabled: false
+
+# ── 채팅 설정 ──────────────────────────────────────────────────────────────
+chat:
+  # PR 코멘트에서 @coderabbitai 멘션 시 자동 응답
+  auto_reply: true
