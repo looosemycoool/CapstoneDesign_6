@@ -1,11 +1,3 @@
----
-name: "Pull Request Template"
-about: "PR 생성 시 사용해주세요"
-title: ""
-labels: ""
-assignees: ""
----
-
 ## 🎯 작업 내용
 
 
