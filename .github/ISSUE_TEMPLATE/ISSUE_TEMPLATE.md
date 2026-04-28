@@ -1,6 +1,6 @@
 ---
-name: "기능 추가"
-about: "기능 추가 시 사용해주세요"
+name: "Issue Template"
+about: "이슈 생성 시 사용해주세요"
 title: ""
 labels: ""
 assignees: ""
