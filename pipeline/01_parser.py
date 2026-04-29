@@ -1,11 +1,20 @@
 import os
+import sys
 import json
 import zipfile
 import subprocess
 import shutil
-import pdfplumber
+import platform
+import fitz  # PyMuPDF
 import pandas as pd
 from docx import Document
+
+# Windows 콘솔(cp949)에서도 한글/유니코드 출력 안전하게
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # 절대 경로로 설정
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -13,72 +22,155 @@ ATTACHMENT_DIR = os.path.join(BASE_DIR, "data", "attachments")
 PARSED_DIR = os.path.join(BASE_DIR, "data", "parsed")
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 TMP_DIR = os.path.join(BASE_DIR, "data", "tmp_convert")
-LIBREOFFICE = r"C:\Program Files\LibreOffice\program\soffice.exe"
-# 한글 to pdf 변환 라이브러리 사용 (반영필요)
 
 os.makedirs(PARSED_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 
+# 추출 텍스트가 이 값보다 적으면 스캔본/변환 실패 가능성 경고
+EMPTY_TEXT_THRESHOLD = 50
+
+
+def find_libreoffice():
+    """LibreOffice 실행 파일 탐색.
+    1) PATH의 soffice 2) Windows 기본 설치 경로 3) None
+    """
+    found = shutil.which("soffice")
+    if found:
+        return found
+    if platform.system() == "Windows":
+        candidates = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+    return None
+
+
+LIBREOFFICE = find_libreoffice()
+
 
 def parse_pdf(file_path):
-    """PDF에서 텍스트 + 표 추출"""
+    """PDF에서 텍스트 + 표 추출 (PyMuPDF)"""
     result = []
     try:
-        with pdfplumber.open(file_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text = page.get_text() or ""
 
-                tables = page.extract_tables()
                 table_texts = []
-                for table in tables:
-                    for row in table:
-                        row_text = " | ".join(
-                            cell.strip() if cell else "" for cell in row
-                        )
-                        table_texts.append(row_text)
+                try:
+                    tables = page.find_tables()
+                    for table in tables:
+                        rows = table.extract()
+                        for row in rows:
+                            row_text = " | ".join(
+                                (cell or "").strip() for cell in row
+                            )
+                            if row_text.strip(" |"):
+                                table_texts.append(row_text)
+                except Exception:
+                    pass  # 표 추출 실패해도 본문 텍스트는 살림
 
                 page_content = text
                 if table_texts:
                     page_content += "\n[표]\n" + "\n".join(table_texts)
-
                 if page_content.strip():
                     result.append(page_content.strip())
-
     except Exception as e:
         print(f"  [PDF 오류] {file_path}: {e}")
-
     return "\n\n".join(result)
 
 
-def hwp_to_txt(file_path):
-    """LibreOffice로 HWP/HWPX → TXT 변환"""
+def _libreoffice_convert(file_path, fmt, ext):
+    """LibreOffice로 변환 후 결과 파일 경로 반환 (실패 시 None)"""
+    if not LIBREOFFICE:
+        print("  [오류] LibreOffice를 찾을 수 없습니다 (PATH 또는 표준 설치 경로 확인 필요).")
+        return None
     try:
         subprocess.run([
             LIBREOFFICE,
             "--headless",
-            "--convert-to", "txt:Text",
+            "--convert-to", fmt,
             "--outdir", TMP_DIR,
             file_path
-        ], timeout=30, capture_output=True)
-
+        ], timeout=60, capture_output=True)
         base_name = os.path.splitext(os.path.basename(file_path))[0]
-        txt_path = os.path.join(TMP_DIR, base_name + ".txt")
-
-        if os.path.exists(txt_path):
-            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-            os.remove(txt_path)
-            return text.strip()
-        else:
-            print(f"  [HWP 변환 실패] txt 파일 없음: {base_name}")
-            return ""
-
+        out_path = os.path.join(TMP_DIR, base_name + "." + ext)
+        return out_path if os.path.exists(out_path) else None
     except subprocess.TimeoutExpired:
         print(f"  [HWP 타임아웃] {file_path}")
+        return None
+    except Exception as e:
+        print(f"  [HWP 변환 오류] {file_path}: {e}")
+        return None
+
+
+def _hwp5txt_extract(file_path):
+    """pyhwp의 hwp5txt로 HWP에서 텍스트 추출 (LibreOffice가 못 읽는 파일용 fallback)"""
+    hwp5txt = shutil.which("hwp5txt")
+    cmd = [hwp5txt, file_path] if hwp5txt else [
+        sys.executable, "-m", "hwp5.hwp5txt", file_path
+    ]
+    try:
+        res = subprocess.run(cmd, timeout=60, capture_output=True)
+        if res.returncode != 0:
+            return ""
+        return res.stdout.decode("utf-8", errors="ignore").strip()
+    except subprocess.TimeoutExpired:
+        print(f"  [hwp5txt 타임아웃] {file_path}")
         return ""
     except Exception as e:
-        print(f"  [HWP 오류] {file_path}: {e}")
+        print(f"  [hwp5txt 오류] {file_path}: {e}")
         return ""
+
+
+def parse_hwp(file_path):
+    """HWP/HWPX 파싱: LibreOffice→PDF→PyMuPDF 우선, 실패 시 pyhwp로 fallback.
+    .hwpx는 pyhwp가 지원 안 하므로 LibreOffice 경로만 사용."""
+    ext = os.path.splitext(file_path)[1].lower()
+
+    # 1차: LibreOffice → PDF → PyMuPDF (표/레이아웃 보존에 유리)
+    pdf_path = _libreoffice_convert(file_path, "pdf", "pdf")
+    if pdf_path:
+        try:
+            text = parse_pdf(pdf_path)
+        except Exception as e:
+            print(f"  [HWP→PDF 추출 실패] {e}")
+            text = ""
+        finally:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+        if text.strip():
+            return text
+        print(f"  [Fallback] HWP→PDF 결과 비어 있음 - 다음 방법 시도")
+
+    # 2차: pyhwp (LibreOffice가 거부하는 HWP 파일에 강함). .hwpx는 미지원.
+    if ext == ".hwp":
+        text = _hwp5txt_extract(file_path)
+        if text:
+            print(f"  [pyhwp로 추출 성공]")
+            return text
+
+    # 3차: LibreOffice → TXT
+    txt_path = _libreoffice_convert(file_path, "txt:Text", "txt")
+    if not txt_path:
+        return ""
+    try:
+        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return text.strip()
+    except Exception as e:
+        print(f"  [TXT 읽기 실패] {e}")
+        return ""
+    finally:
+        try:
+            os.remove(txt_path)
+        except OSError:
+            pass
 
 
 def parse_xlsx(file_path):
@@ -138,7 +230,7 @@ def parse_zip(file_path):
                 if ext == ".pdf":
                     text = parse_pdf(inner_path)
                 elif ext in [".hwp", ".hwpx"]:
-                    text = hwp_to_txt(inner_path)
+                    text = parse_hwp(inner_path)
                 elif ext in [".xlsx", ".xls"]:
                     text = parse_xlsx(inner_path)
                 elif ext == ".docx":
@@ -162,7 +254,7 @@ def parse_file(file_path):
     if ext == ".pdf":
         return parse_pdf(file_path)
     elif ext in [".hwp", ".hwpx"]:
-        return hwp_to_txt(file_path)
+        return parse_hwp(file_path)
     elif ext in [".xlsx", ".xls"]:
         return parse_xlsx(file_path)
     elif ext == ".docx":
@@ -174,13 +266,43 @@ def parse_file(file_path):
         return ""
 
 
+def warn_if_empty(file_name, text):
+    """추출 텍스트가 너무 적으면 경고 (스캔본 PDF 등 의심)"""
+    if not text:
+        print(f"  [!경고] 추출 실패 (0자): {file_name}")
+    elif len(text) < EMPTY_TEXT_THRESHOLD:
+        print(f"  [!경고] 추출 텍스트 매우 적음 ({len(text)}자) - 스캔본 가능성: {file_name}")
+
+
 def parse_all():
-    """전체 첨부파일 파싱 후 notices.json과 합쳐서 저장"""
+    """크롤링 첨부파일 파싱 (증분: 기존 결과가 있으면 재사용)"""
     notices_path = os.path.join(RAW_DIR, "notices.json")
+    output_path = os.path.join(PARSED_DIR, "notices_parsed.json")
+
     with open(notices_path, encoding="utf-8") as f:
         notices = json.load(f)
 
+    # 기존 파싱 결과 로드 (증분 파싱)
+    existing = {}
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            for n in prev:
+                try:
+                    wr = n["url"].split("wr_id=")[1].split("&")[0]
+                except (KeyError, IndexError):
+                    continue
+                existing[wr] = {
+                    a["name"]: a.get("parsed_text", "")
+                    for a in n.get("attachments", []) if a.get("name")
+                }
+        except Exception:
+            existing = {}
+
     print(f"[시작] 첨부파일 파싱 (공지 {len(notices)}개)")
+    cached_count = 0
+    parsed_count = 0
 
     for notice in notices:
         wr_id = notice["url"].split("wr_id=")[1].split("&")[0]
@@ -196,6 +318,13 @@ def parse_all():
             file_name = att["name"]
             file_path = os.path.join(attach_dir, file_name)
 
+            cached = existing.get(wr_id, {}).get(file_name, "")
+            if cached:
+                att["parsed_text"] = cached
+                cached_count += 1
+                print(f"  [캐시] {file_name} ({len(cached)}자)")
+                continue
+
             if not os.path.exists(file_path):
                 print(f"  [없음] {file_name}")
                 continue
@@ -203,34 +332,43 @@ def parse_all():
             print(f"  파싱 중: {file_name}")
             text = parse_file(file_path)
             att["parsed_text"] = text
+            warn_if_empty(file_name, text)
             print(f"  완료: {len(text)}자 추출")
+            parsed_count += 1
 
-    output_path = os.path.join(PARSED_DIR, "notices_parsed.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(notices, f, ensure_ascii=False, indent=2)
 
+    total_files = sum(len(n.get("attachments", [])) for n in notices)
+    success = sum(
+        1 for n in notices for a in n.get("attachments", []) if a.get("parsed_text")
+    )
+
     print(f"\n[완료] 파싱 결과 저장 → {output_path}")
-
-    total_files = 0
-    parsed_files = 0
-    for notice in notices:
-        for att in notice.get("attachments", []):
-            total_files += 1
-            if att.get("parsed_text"):
-                parsed_files += 1
-
-    print(f"파싱 성공: {parsed_files}/{total_files}개")
+    print(f"신규 파싱: {parsed_count}개 / 캐시 재사용: {cached_count}개 / 성공: {success}/{total_files}개")
+    _cleanup_tmp()
 
 
 def parse_manual_files():
-    """manual_files 폴더의 파일들 파싱"""
+    """manual_files 폴더의 파일들 파싱 (증분)"""
     manual_dir = os.path.join(BASE_DIR, "data", "manual_files")
     output_path = os.path.join(PARSED_DIR, "manual_parsed.json")
 
+    existing = {}
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            existing = {r["file_name"]: r.get("parsed_text", "") for r in prev if r.get("file_name")}
+        except Exception:
+            existing = {}
+
     results = []
+    cached_count = 0
+    parsed_count = 0
     print(f"[시작] manual_files 파싱")
 
-    for fname in os.listdir(manual_dir):
+    for fname in sorted(os.listdir(manual_dir)):
         fpath = os.path.join(manual_dir, fname)
         ext = os.path.splitext(fname)[1].lower()
 
@@ -238,29 +376,51 @@ def parse_manual_files():
             print(f"  [스킵] {fname}")
             continue
 
-        print(f"  파싱 중: {fname}")
+        if fname in existing and existing[fname]:
+            print(f"  [캐시] {fname} ({len(existing[fname])}자)")
+            results.append({"file_name": fname, "parsed_text": existing[fname]})
+            cached_count += 1
+            continue
 
+        print(f"  파싱 중: {fname}")
         if ext == ".txt":
             with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read().strip()
         else:
             text = parse_file(fpath)
 
+        warn_if_empty(fname, text)
         print(f"  완료: {len(text)}자 추출")
-        results.append({
-            "file_name": fname,
-            "file_path": fpath,
-            "parsed_text": text
-        })
+        results.append({"file_name": fname, "parsed_text": text})
+        parsed_count += 1
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
+    success = sum(1 for r in results if r["parsed_text"])
     print(f"\n[완료] 저장 → {output_path}")
-    print(f"파싱 성공: {sum(1 for r in results if r['parsed_text'])}/{len(results)}개")
+    print(f"신규 파싱: {parsed_count}개 / 캐시 재사용: {cached_count}개 / 성공: {success}/{len(results)}개")
+    _cleanup_tmp()
+
+
+def _cleanup_tmp():
+    """LibreOffice 임시 산출물 정리"""
+    if os.path.exists(TMP_DIR):
+        for f in os.listdir(TMP_DIR):
+            try:
+                os.remove(os.path.join(TMP_DIR, f))
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
+    if not LIBREOFFICE:
+        print("[경고] LibreOffice를 찾지 못했습니다. HWP/HWPX 파싱이 실패할 수 있습니다.")
+        print("       - macOS/Linux: 'soffice' 명령이 PATH에 있는지 확인")
+        print("       - Windows: C:\\Program Files\\LibreOffice\\program\\soffice.exe 설치 확인")
+    else:
+        print(f"[LibreOffice] {LIBREOFFICE}")
+
     # 1. 기존 공지사항 첨부파일 파싱
     # parse_all()
 

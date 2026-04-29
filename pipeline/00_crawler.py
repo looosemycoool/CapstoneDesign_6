@@ -16,12 +16,16 @@ ATTACHMENT_DIR = "./data/attachments"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(ATTACHMENT_DIR, exist_ok=True)
 
+# 세션 유지: 그누보드는 다운로드 시 세션 쿠키를 검증함
+session = requests.Session()
+session.headers.update(HEADERS)
+
 
 def get_notice_list(page=1):
     """공지사항 목록 한 페이지 크롤링"""
     params = {**PARAMS, "page": page}
     try:
-        res = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=10)
+        res = session.get(BASE_URL, params=params, timeout=10)
         res.raise_for_status()
         return res.text
     except requests.exceptions.RequestException as e:
@@ -72,7 +76,7 @@ def parse_notice_list(html):
 def get_notice_detail(url):
     """게시글 상세 내용 + 첨부파일 URL 수집"""
     try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
+        res = session.get(url, timeout=10)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
 
@@ -170,6 +174,13 @@ def download_attachments(notices):
         save_dir = os.path.join(ATTACHMENT_DIR, wr_id)
         os.makedirs(save_dir, exist_ok=True)
 
+        # 다운로드 전에 게시글 상세 페이지를 한 번 방문해서 세션 쿠키 확보
+        notice_url = notice["url"]
+        try:
+            session.get(notice_url, timeout=10)
+        except requests.exceptions.RequestException:
+            pass  # 실패해도 다운로드는 시도
+
         for att in attachments:
             file_name = att["name"]
             file_url = att["url"]
@@ -188,8 +199,26 @@ def download_attachments(notices):
                 continue
 
             try:
-                res = requests.get(file_url, headers=HEADERS, timeout=30)
+                # Referer를 해당 게시글 상세 URL로 지정해야 다운로드 허용됨
+                res = session.get(
+                    file_url,
+                    headers={"Referer": notice_url},
+                    timeout=30
+                )
                 res.raise_for_status()
+
+                # 응답이 실제 파일이 아닌 HTML(오류 페이지)인지 검증
+                content_type = res.headers.get("Content-Type", "").lower()
+                head = res.content[:512].lstrip().lower()
+                is_html = (
+                    "text/html" in content_type
+                    or head.startswith(b"<!doctype html")
+                    or head.startswith(b"<html")
+                )
+                if is_html:
+                    print(f"  [실패] HTML 응답 (다운로드 거부됨): {file_name}")
+                    failed += 1
+                    continue
 
                 with open(save_path, "wb") as f:
                     f.write(res.content)
