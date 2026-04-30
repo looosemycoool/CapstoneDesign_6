@@ -92,8 +92,12 @@ def parse_pdf_batch(file_paths):
                 input_path=copied_inputs, output_dir=out_dir, format="markdown"
             )
         except (RuntimeError, OSError, ValueError) as e:
-            print(f"  [PDF 배치 변환 오류] {e}")
-            return results
+            # 배치 변환은 보통 환경 문제(JVM/Java 누락 등)에서 실패한다.
+            # 빈 결과를 silent 하게 저장하면 호출자가 실패 인지 못 하므로 raise.
+            raise RuntimeError(
+                f"opendataloader-pdf 변환 실패 ({len(copied_inputs)}개 PDF). "
+                f"Java 11+ 설치 여부 확인 필요. 원본: {e}"
+            ) from e
 
         for fname in os.listdir(out_dir):
             if not fname.endswith(".md"):
@@ -282,7 +286,9 @@ def parse_zip(file_path):
                 text = parse_docx(inner_path)
 
             if text:
-                result.append(f"[ZIP 내부: {fname}]\n{text}")
+                # ZIP 안에 같은 이름이 다른 디렉터리에 있을 수 있어 상대 경로 사용
+                rel = os.path.relpath(inner_path, tmp_zip_dir)
+                result.append(f"[ZIP 내부: {rel}]\n{text}")
 
     except Exception as e:
         print(f"  [ZIP 오류] {file_path}: {e}")
