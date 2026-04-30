@@ -5,7 +5,8 @@ import zipfile
 import subprocess
 import shutil
 import platform
-import fitz  # PyMuPDF
+import tempfile
+import opendataloader_pdf
 import pandas as pd
 from docx import Document
 
@@ -51,36 +52,69 @@ def find_libreoffice():
 LIBREOFFICE = find_libreoffice()
 
 
+def parse_pdf_batch(file_paths):
+    """opendataloader_pdf로 여러 PDF를 한 번에 Markdown으로 변환.
+    JVM 부팅이 호출당 ~수백ms라 배치가 필수. 반환: dict[절대경로]→markdown 텍스트.
+
+    같은 basename을 가진 PDF가 다른 디렉터리에 있을 수 있으므로 (예: 서로 다른
+    공지의 동명 첨부) 인덱스 prefix를 붙여 입력 디렉터리에 복사한 뒤 변환한다.
+    """
+    if not file_paths:
+        return {}
+    abs_paths = [os.path.abspath(p) for p in file_paths]
+    results = {p: "" for p in abs_paths}
+    with tempfile.TemporaryDirectory() as tmp:
+        in_dir = os.path.join(tmp, "in")
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+
+        # 인덱스 prefix를 붙여 복사 → md 파일 stem으로 원본 경로를 역추적
+        stem_to_orig = {}
+        copied_inputs = []
+        for i, p in enumerate(abs_paths):
+            base = os.path.splitext(os.path.basename(p))[0]
+            new_stem = f"{i:04d}_{base}"
+            new_path = os.path.join(in_dir, new_stem + ".pdf")
+            # 복사 실패는 환경 문제(권한/디스크 등)이므로 OSError 가 자연스럽게 전파됨
+            shutil.copyfile(p, new_path)
+            stem_to_orig[new_stem] = p
+            copied_inputs.append(new_path)
+
+        if not copied_inputs:
+            return results
+
+        try:
+            opendataloader_pdf.convert(
+                input_path=copied_inputs, output_dir=out_dir, format="markdown"
+            )
+        except (RuntimeError, OSError, ValueError) as e:
+            # 배치 변환은 보통 환경 문제(JVM/Java 누락 등)에서 실패한다.
+            # 빈 결과를 silent 하게 저장하면 호출자가 실패 인지 못 하므로 raise.
+            raise RuntimeError(
+                f"opendataloader-pdf 변환 실패 ({len(copied_inputs)}개 PDF). "
+                f"Java 11+ 설치 여부 확인 필요. 원본: {e}"
+            ) from e
+
+        for fname in os.listdir(out_dir):
+            if not fname.endswith(".md"):
+                continue
+            stem = os.path.splitext(fname)[0]
+            orig = stem_to_orig.get(stem)
+            if not orig:
+                continue
+            try:
+                with open(os.path.join(out_dir, fname), encoding="utf-8") as f:
+                    results[orig] = f.read().strip()
+            except OSError as e:
+                print(f"  [PDF md 읽기 오류] {orig}: {e}")
+    return results
+
+
 def parse_pdf(file_path):
-    """PDF에서 텍스트 + 표 추출 (PyMuPDF)"""
-    result = []
-    try:
-        with fitz.open(file_path) as doc:
-            for page in doc:
-                text = page.get_text() or ""
-
-                table_texts = []
-                try:
-                    tables = page.find_tables()
-                    for table in tables:
-                        rows = table.extract()
-                        for row in rows:
-                            row_text = " | ".join(
-                                (cell or "").strip() for cell in row
-                            )
-                            if row_text.strip(" |"):
-                                table_texts.append(row_text)
-                except Exception:
-                    pass  # 표 추출 실패해도 본문 텍스트는 살림
-
-                page_content = text
-                if table_texts:
-                    page_content += "\n[표]\n" + "\n".join(table_texts)
-                if page_content.strip():
-                    result.append(page_content.strip())
-    except Exception as e:
-        print(f"  [PDF 오류] {file_path}: {e}")
-    return "\n\n".join(result)
+    """단일 PDF 파싱. 내부적으로 parse_pdf_batch 호출 (JVM 1회 부팅 비용 발생)."""
+    abs_path = os.path.abspath(file_path)
+    return parse_pdf_batch([abs_path]).get(abs_path, "")
 
 
 def _libreoffice_convert(file_path, fmt, ext):
@@ -213,32 +247,49 @@ def parse_docx(file_path):
 
 
 def parse_zip(file_path):
-    """ZIP 압축 해제 후 내부 파일 파싱"""
+    """ZIP 압축 해제 후 내부 파일 파싱. 내부 PDF는 한 번에 배치 처리."""
     result = []
     tmp_zip_dir = os.path.join(BASE_DIR, "data", "tmp_zip")
     try:
         os.makedirs(tmp_zip_dir, exist_ok=True)
+        # zip-slip 방지: 추출 경로가 base 디렉터리를 벗어나는 엔트리는 거부
+        base_dir = os.path.realpath(tmp_zip_dir) + os.sep
         with zipfile.ZipFile(file_path, "r") as z:
-            z.extractall(tmp_zip_dir)
+            for member in z.infolist():
+                target = os.path.realpath(os.path.join(tmp_zip_dir, member.filename))
+                if not (target + os.sep).startswith(base_dir):
+                    print(f"  [ZIP 위험 엔트리 거부] {member.filename}")
+                    continue
+                z.extract(member, tmp_zip_dir)
 
+        # 내부 파일 수집 (확장자별 분류)
+        inner_files = []
         for root, _, files in os.walk(tmp_zip_dir):
             for fname in files:
-                inner_path = os.path.join(root, fname)
-                ext = os.path.splitext(fname)[1].lower()
-                text = ""
+                inner_files.append((fname, os.path.join(root, fname)))
+        pdf_paths = [p for f, p in inner_files if os.path.splitext(f)[1].lower() == ".pdf"]
+        pdf_results = parse_pdf_batch(pdf_paths) if pdf_paths else {}
 
-                if ext == ".pdf":
-                    text = parse_pdf(inner_path)
-                elif ext in [".hwp", ".hwpx"]:
-                    text = parse_hwp(inner_path)
-                elif ext in [".xlsx", ".xls"]:
-                    text = parse_xlsx(inner_path)
-                elif ext == ".docx":
-                    text = parse_docx(inner_path)
+        for fname, inner_path in inner_files:
+            ext = os.path.splitext(fname)[1].lower()
+            text = ""
+            if ext == ".pdf":
+                text = pdf_results.get(os.path.abspath(inner_path), "")
+            elif ext in [".hwp", ".hwpx"]:
+                text = parse_hwp(inner_path)
+            elif ext in [".xlsx", ".xls"]:
+                text = parse_xlsx(inner_path)
+            elif ext == ".docx":
+                text = parse_docx(inner_path)
 
-                if text:
-                    result.append(f"[ZIP 내부: {fname}]\n{text}")
+            if text:
+                # ZIP 안에 같은 이름이 다른 디렉터리에 있을 수 있어 상대 경로 사용
+                rel = os.path.relpath(inner_path, tmp_zip_dir)
+                result.append(f"[ZIP 내부: {rel}]\n{text}")
 
+    except RuntimeError:
+        # parse_pdf_batch가 raise한 환경 오류는 상위로 그대로 전파
+        raise
     except Exception as e:
         print(f"  [ZIP 오류] {file_path}: {e}")
     finally:
@@ -304,8 +355,36 @@ def parse_all():
     cached_count = 0
     parsed_count = 0
 
+    # PDF 배치 변환을 위해 처리 대상 PDF 경로 먼저 수집
+    pdf_to_process = []
     for notice in notices:
-        wr_id = notice["url"].split("wr_id=")[1].split("&")[0]
+        try:
+            wr_id = notice["url"].split("wr_id=")[1].split("&")[0]
+        except (KeyError, IndexError):
+            continue
+        attach_dir = os.path.join(ATTACHMENT_DIR, wr_id)
+        for att in notice.get("attachments", []):
+            file_name = att["name"]
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext != ".pdf":
+                continue
+            cached = existing.get(wr_id, {}).get(file_name, "")
+            if cached:
+                continue
+            file_path = os.path.join(attach_dir, file_name)
+            if os.path.exists(file_path):
+                pdf_to_process.append(file_path)
+
+    pdf_results = {}
+    if pdf_to_process:
+        print(f"[PDF 배치] {len(pdf_to_process)}개 PDF를 opendataloader로 변환 중...")
+        pdf_results = parse_pdf_batch(pdf_to_process)
+
+    for notice in notices:
+        try:
+            wr_id = notice["url"].split("wr_id=")[1].split("&")[0]
+        except (KeyError, IndexError):
+            continue
         attach_dir = os.path.join(ATTACHMENT_DIR, wr_id)
         attachments = notice.get("attachments", [])
 
@@ -317,6 +396,7 @@ def parse_all():
         for att in attachments:
             file_name = att["name"]
             file_path = os.path.join(attach_dir, file_name)
+            ext = os.path.splitext(file_name)[1].lower()
 
             cached = existing.get(wr_id, {}).get(file_name, "")
             if cached:
@@ -329,8 +409,11 @@ def parse_all():
                 print(f"  [없음] {file_name}")
                 continue
 
-            print(f"  파싱 중: {file_name}")
-            text = parse_file(file_path)
+            if ext == ".pdf":
+                text = pdf_results.get(os.path.abspath(file_path), "")
+            else:
+                print(f"  파싱 중: {file_name}")
+                text = parse_file(file_path)
             att["parsed_text"] = text
             warn_if_empty(file_name, text)
             print(f"  완료: {len(text)}자 추출")
@@ -368,6 +451,18 @@ def parse_manual_files():
     parsed_count = 0
     print(f"[시작] manual_files 파싱")
 
+    # PDF 배치 변환 대상 수집
+    pdf_to_process = []
+    for fname in sorted(os.listdir(manual_dir)):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext == ".pdf" and not existing.get(fname):
+            pdf_to_process.append(os.path.join(manual_dir, fname))
+
+    pdf_results = {}
+    if pdf_to_process:
+        print(f"[PDF 배치] {len(pdf_to_process)}개 PDF를 opendataloader로 변환 중...")
+        pdf_results = parse_pdf_batch(pdf_to_process)
+
     for fname in sorted(os.listdir(manual_dir)):
         fpath = os.path.join(manual_dir, fname)
         ext = os.path.splitext(fname)[1].lower()
@@ -376,17 +471,21 @@ def parse_manual_files():
             print(f"  [스킵] {fname}")
             continue
 
-        if fname in existing and existing[fname]:
-            print(f"  [캐시] {fname} ({len(existing[fname])}자)")
-            results.append({"file_name": fname, "parsed_text": existing[fname]})
+        cached_text = existing.get(fname)
+        if cached_text:
+            print(f"  [캐시] {fname} ({len(cached_text)}자)")
+            results.append({"file_name": fname, "parsed_text": cached_text})
             cached_count += 1
             continue
 
-        print(f"  파싱 중: {fname}")
-        if ext == ".txt":
+        if ext == ".pdf":
+            text = pdf_results.get(os.path.abspath(fpath), "")
+        elif ext == ".txt":
+            print(f"  파싱 중: {fname}")
             with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read().strip()
         else:
+            print(f"  파싱 중: {fname}")
             text = parse_file(fpath)
 
         warn_if_empty(fname, text)
