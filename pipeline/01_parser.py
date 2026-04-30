@@ -54,28 +54,59 @@ LIBREOFFICE = find_libreoffice()
 
 def parse_pdf_batch(file_paths):
     """opendataloader_pdf로 여러 PDF를 한 번에 Markdown으로 변환.
-    JVM 부팅이 호출당 ~수백ms라 배치가 필수. 반환: dict[절대경로]→markdown 텍스트."""
+    JVM 부팅이 호출당 ~수백ms라 배치가 필수. 반환: dict[절대경로]→markdown 텍스트.
+
+    같은 basename을 가진 PDF가 다른 디렉터리에 있을 수 있으므로 (예: 서로 다른
+    공지의 동명 첨부) 인덱스 prefix를 붙여 입력 디렉터리에 복사한 뒤 변환한다.
+    """
     if not file_paths:
         return {}
     abs_paths = [os.path.abspath(p) for p in file_paths]
     results = {p: "" for p in abs_paths}
     with tempfile.TemporaryDirectory() as tmp:
+        in_dir = os.path.join(tmp, "in")
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+
+        # 인덱스 prefix를 붙여 복사 → md 파일 stem으로 원본 경로를 역추적
+        stem_to_orig = {}
+        copied_inputs = []
+        for i, p in enumerate(abs_paths):
+            base = os.path.splitext(os.path.basename(p))[0]
+            new_stem = f"{i:04d}_{base}"
+            new_path = os.path.join(in_dir, new_stem + ".pdf")
+            try:
+                shutil.copyfile(p, new_path)
+            except OSError as e:
+                print(f"  [PDF 복사 실패] {p}: {e}")
+                continue
+            stem_to_orig[new_stem] = p
+            copied_inputs.append(new_path)
+
+        if not copied_inputs:
+            return results
+
         try:
             opendataloader_pdf.convert(
-                input_path=abs_paths, output_dir=tmp, format="markdown"
+                input_path=copied_inputs, output_dir=out_dir, format="markdown"
             )
-        except Exception as e:
+        except (RuntimeError, OSError, ValueError) as e:
             print(f"  [PDF 배치 변환 오류] {e}")
             return results
-        for p in abs_paths:
-            stem = os.path.splitext(os.path.basename(p))[0]
-            md_path = os.path.join(tmp, stem + ".md")
-            if os.path.exists(md_path):
-                try:
-                    with open(md_path, encoding="utf-8") as f:
-                        results[p] = f.read().strip()
-                except Exception as e:
-                    print(f"  [PDF md 읽기 오류] {p}: {e}")
+
+        for fname in os.listdir(out_dir):
+            if not fname.endswith(".md"):
+                continue
+            stem = os.path.splitext(fname)[0]
+            orig = stem_to_orig.get(stem)
+            if not orig:
+                continue
+            try:
+                with open(os.path.join(out_dir, fname), encoding="utf-8") as f:
+                    results[orig] = f.read().strip()
+            except OSError as e:
+                print(f"  [PDF md 읽기 오류] {orig}: {e}")
     return results
 
 
@@ -220,8 +251,15 @@ def parse_zip(file_path):
     tmp_zip_dir = os.path.join(BASE_DIR, "data", "tmp_zip")
     try:
         os.makedirs(tmp_zip_dir, exist_ok=True)
+        # zip-slip 방지: 추출 경로가 base 디렉터리를 벗어나는 엔트리는 거부
+        base_dir = os.path.realpath(tmp_zip_dir) + os.sep
         with zipfile.ZipFile(file_path, "r") as z:
-            z.extractall(tmp_zip_dir)
+            for member in z.infolist():
+                target = os.path.realpath(os.path.join(tmp_zip_dir, member.filename))
+                if not (target + os.sep).startswith(base_dir):
+                    print(f"  [ZIP 위험 엔트리 거부] {member.filename}")
+                    continue
+                z.extract(member, tmp_zip_dir)
 
         # 내부 파일 수집 (확장자별 분류)
         inner_files = []

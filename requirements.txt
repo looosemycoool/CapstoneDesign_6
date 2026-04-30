@@ -1,6 +1,6 @@
 requests==2.31.0
 beautifulsoup4==4.12.3
-opendataloader-pdf
+opendataloader-pdf==2.4.1
 pyhwp==0.1b15
 
 chromadb==0.6.3
