@@ -53,7 +53,10 @@ def vector_search(query, n_results=3):
     embedding_fn = get_embedding_function()
     client = get_chroma_client()
 
-    existing_collections = client.list_collections()
+    existing_collections = [
+    c.name if hasattr(c, 'name') else c
+    for c in client.list_collections()
+    ]
     if COLLECTION_NAME not in existing_collections:
         raise ValueError(
             f"컬렉션이 없습니다: {COLLECTION_NAME} | 현재 컬렉션: {existing_collections}"
