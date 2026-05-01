@@ -5,7 +5,7 @@ import chromadb
 from chromadb.config import Settings
 from neo4j import GraphDatabase
 from openai import OpenAI
-from langchain_openai import OpenAIEmbeddings
+from langchain_upstage import UpstageEmbeddings
 
 # ── 경로 / 환경변수 ─────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,19 +17,19 @@ load_dotenv(ENV_PATH)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # 실제 생성된 컬렉션 이름에 맞춤
 EXPERIMENT_ID = "openai_small"
 COLLECTION_NAME = f"knu_cse_{EXPERIMENT_ID}"
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
 
 
 def get_embedding_function():
-    return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        api_key=OPENAI_API_KEY
+    return UpstageEmbeddings(
+        model="solar-embedding-1-large-passage",
+        api_key=UPSTAGE_API_KEY,
     )
 
 
@@ -245,7 +245,7 @@ def generate_answer(query, context, model="gpt-4o-mini"):
 [답변]
 """
 
-    response = openai_client.chat.completions.create(
+    response = upstage_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2
@@ -280,7 +280,7 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
                 print(f"  - {rel['from']} --[{rel['relation']}]--> {rel['to']}")
 
     context = merge_results(vector_docs, graph_relations)
-    answer = generate_answer(query, context)
+    answer = generate_answer(query, context, model = "solar-pro")
 
     if verbose:
         print(f"\n[최종 답변]\n{answer}")

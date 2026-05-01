@@ -15,10 +15,10 @@ load_dotenv(ENV_PATH)
 NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-EXTRACT_MODEL = "gpt-4o-mini"   # 개체·관계 추출 및 노드 통합에 사용
+upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
+EXTRACT_MODEL = "solar-pro"   # 개체·관계 추출 및 노드 통합에 사용
 
 
 # ── Neo4j 드라이버 ────────────────────────────────────────
@@ -74,11 +74,11 @@ def safe_json_load(text: str):
     return json.loads(text)
 
 
-# ── Step 1: 개체·관계 자동 추출 (GPT-4o-mini, 동적 스키마) ──────
+# ── Step 1: 개체·관계 자동 추출 (solar-pro, 동적 스키마) ──────
 def extract_entities_and_relations(file_name: str, text: str) -> dict:
-    """GPT-4o-mini를 사용해 문서에서 개체·관계를 동적으로 추출 (스키마 고정 없음)"""
+    """solar-pro를 사용해 문서에서 개체·관계를 동적으로 추출 (스키마 고정 없음)"""
     prompt = f"""당신은 대학 행정 문서에서 지식 그래프를 구축하는 전문가입니다.
-아래 경북대학교 컴퓨터학부 문서를 읽고, 의미 있는 개체(노드)와 개체 간 관계(엣지)를 추출하세요.
+아래 경북대학교 문서를 읽고, 의미 있는 개체(노드)와 개체 간 관계(엣지)를 추출하세요.
 
 파일명: {file_name}
 문서 내용:
@@ -117,7 +117,7 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 }}"""
 
     try:
-        response = openai_client.chat.completions.create(
+        response = upstage_client.chat.completions.create(
             model=EXTRACT_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
@@ -138,11 +138,11 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
         return {"entities": entities, "relations": relations}
 
     except Exception as e:
-        print(f"  [OpenAI 오류] {e}")
+        print(f"  [Upstage 오류] {e}")
         return {"entities": [], "relations": []}
 
 
-# ── Step 2: 유사 노드 통합 (GPT-4o-mini) ──────────────────────
+# ── Step 2: 유사 노드 통합 (solar-pro) ──────────────────────
 def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
     """전체 노드 목록에서 의미가 유사한 노드를 하나의 대표 이름으로 통합.
     반환: {원본 이름 → 대표 이름} 매핑"""
@@ -174,7 +174,7 @@ def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
 }}"""
 
     try:
-        response = openai_client.chat.completions.create(
+        response = upstage_client.chat.completions.create(
             model=EXTRACT_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
@@ -271,8 +271,8 @@ def create_relation(session, from_name: str, to_name: str, rel_type: str):
 # ── 전체 그래프 구축 ─────────────────────────────────────
 def build_graph():
     """전체 그래프 구축
-    1단계: GPT-4o-mini로 각 문서에서 개체·관계 동적 추출
-    2단계: GPT-4o-mini로 전체 노드에서 유사 노드 통합 후 Neo4j 저장
+    1단계: solar-pro로 각 문서에서 개체·관계 동적 추출
+    2단계: solar-pro로 전체 노드에서 유사 노드 통합 후 Neo4j 저장
     """
     manual_path = os.path.join(PARSED_DIR, "manual_parsed.json")
     if not os.path.exists(manual_path):
@@ -285,7 +285,7 @@ def build_graph():
     driver = get_driver()
     clear_db(driver)
 
-    print(f"[시작] Graph DB 구축 ({len(manual_files)}개 파일) — GPT-4o-mini 동적 추출 모드")
+    print(f"[시작] Graph DB 구축 ({len(manual_files)}개 파일) — solar-pro 동적 추출 모드")
 
     # ── 1단계: 문서별 개체·관계 추출 및 저장 ──────────────
     all_entity_names = []       # 통합 대상 수집용
@@ -316,7 +316,7 @@ def build_graph():
 
     # ── 2단계: 전체 노드 이름 중복 제거 후 유사 노드 통합 ──
     unique_names = list(dict.fromkeys(all_entity_names))  # 순서 유지 중복 제거
-    print(f"\n[노드 통합] 고유 개체명 {len(unique_names)}개 → GPT-4o-mini 유사도 분석 중...")
+    print(f"\n[노드 통합] 고유 개체명 {len(unique_names)}개 → solar-pro 유사도 분석 중...")
 
     # 노드가 많으면 배치로 나눠 처리
     BATCH = 80
