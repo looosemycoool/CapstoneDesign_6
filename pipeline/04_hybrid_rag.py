@@ -20,7 +20,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # 실제 생성된 컬렉션 이름에 맞춤
-EXPERIMENT_ID = "openai_small"
+EXPERIMENT_ID = "upstage_pro"  # 6개 실험 중 하나로 설정
 COLLECTION_NAME = f"knu_cse_{EXPERIMENT_ID}"
 
 upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
@@ -229,7 +229,7 @@ def merge_results(vector_docs, graph_relations):
 
 
 # ── LLM 답변 생성 ─────────────────────────────────────────
-def generate_answer(query, context, model="gpt-4o-mini"):
+def generate_answer(query, context, model="solar-pro"):
     """컨텍스트 기반 LLM 답변 생성"""
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
 아래 검색된 문서 내용과 그래프 관계 정보를 바탕으로 질문에 답변하세요.
@@ -303,7 +303,7 @@ def vector_only_rag(query, verbose=True):
 
     vector_docs = vector_search(query, n_results=3)
     context = merge_results(vector_docs, [])
-    answer = generate_answer(query, context)
+    answer = generate_answer(query, context, model = "solar-pro")
 
     if verbose:
         print(f"\n[Vector Only 답변]\n{answer}")
