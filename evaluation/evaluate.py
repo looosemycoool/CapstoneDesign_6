@@ -12,7 +12,7 @@ from openpyxl.utils import get_column_letter
 
 
 # ── 깔끔한 xlsx 저장 ──────────────────────────────────────
-def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp):
+def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp, category_stats=None):
     """
     시트 구성:
       ① 요약  : 모델 정보 + Excel 수식 자동 집계
@@ -107,6 +107,48 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
     ws1.column_dimensions["A"].width = 20
     ws1.column_dimensions["B"].width = 30
+
+    if category_stats:
+        # 빈 행 하나
+        start_row = 15
+
+        # 섹션 타이틀
+        ws1.merge_cells(f"A{start_row}:F{start_row}")
+        title_cell = ws1[f"A{start_row}"]
+        title_cell.value = "📊 질문 유형별 성공률"
+        title_cell.font = H_FONT
+        title_cell.fill = TEAL_FILL
+        title_cell.alignment = AL_C
+        ws1.row_dimensions[start_row].height = 22
+
+        # 테이블 헤더
+        cat_headers = ["질문 유형", "질문 수", "Vector 성공 수", "Vector 성공률", "Hybrid 성공 수", "Hybrid 성공률"]
+        cat_widths  = [18, 10, 14, 14, 14, 14]
+        for col_idx, (h, w) in enumerate(zip(cat_headers, cat_widths), start=1):
+            cell = ws1.cell(row=start_row + 1, column=col_idx, value=h)
+            cell.font = H_FONT
+            cell.fill = BLUE_FILL
+            cell.alignment = AL_C
+            ws1.column_dimensions[get_column_letter(col_idx)].width = w
+
+        # 유형별 데이터 행
+        for row_offset, (cat, stat) in enumerate(category_stats.items(), start=2):
+            r = start_row + row_offset
+            data = [
+                cat,
+                stat["total"],
+                stat["vector_success_count"],
+                f"{stat['vector_success_rate']}%",
+                stat["hybrid_success_count"],
+                f"{stat['hybrid_success_rate']}%",
+            ]
+            for col_idx, val in enumerate(data, start=1):
+                cell = ws1.cell(row=r, column=col_idx, value=val)
+                cell.font = N_FONT
+                cell.alignment = AL_TC if col_idx > 1 else AL_C
+                cell.border = Border(
+                    left=thin, right=thin, top=thin, bottom=thin
+                )
 
     # ── ② 결과 시트 ──────────────────────────────────────
     ws2 = wb.create_sheet("② 결과")
@@ -286,24 +328,28 @@ def llm_judge(question, ground_truth, generated_answer):
     if not generated_answer or not ground_truth:
         return False
 
-    prompt = f"""당신은 QA 평가자입니다.
-            아래 질문에 대한 정답과 AI가 생성한 답변을 비교하여,
-            생성된 답변이 정답의 핵심 내용을 올바르게 포함하고 있는지 판단하세요.
+    prompt = f"""당신은 대학교 학사 공지사항 챗봇의 신뢰성을 검증하는 엄격한 AI 심사위원입니다.
+            아래 [질문]에 대한 [실제 정답]과 [챗봇이 생성한 답변]을 비교하여 정확성을 평가하세요.
 
             [질문]
             {question}
 
-            [정답 (Ground Truth)]
+            [실제 정답 (Ground Truth)]
             {ground_truth}
 
-            [생성된 답변]
+            [챗봇이 생성한 답변]
             {generated_answer}
 
-            판단 기준:
-            - 정답의 핵심 사실이 생성된 답변에 포함되어 있으면 "correct"
-            - 핵심 사실이 빠져 있거나 틀린 정보가 있으면 "incorrect"
+            평가 과정 (반드시 아래 순서대로 생각하세요):
+            1. Ground Truth에서 반드시 포함되어야 할 '핵심 정보'들을 추출하세요.
+            2. 챗봇의 답변이 그 핵심 정보들을 모두 누락 없이 포함하고 있는지 대조하세요.
+            3. 챗봇의 답변에 Ground Truth에 없는 '지어낸 거짓 정보(Hallucination)'가 섞여 있는지 확인하세요. 단순한 어조의 차이나 올바른 부연 설명은 괜찮습니다.
 
-            반드시 "correct" 또는 "incorrect" 중 하나만 출력하세요.
+            마지막 줄에 반드시 "correct" 또는 "incorrect"만 단독으로 출력하세요.
+
+            판단 기준:
+            - 정답의 핵심 정보가 모두 포함되어 있고, 사실과 다른 거짓 정보가 없으면 "correct" (서술 순서나 표현 방식이 달라도 무방함)
+            - 핵심 정보 중 하나라도 누락되었거나, 정답과 모순되는 명백한 거짓 정보가 포함되어 있으면 "incorrect"
             """
     try:
         from openai import OpenAI
@@ -454,8 +500,23 @@ def run_evaluation():
 
     df = pd.DataFrame(rows)
 
-    # 엑셀 저장
-    _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp)
+    df = pd.DataFrame(rows)
+
+    # ── 유형별 성공률 집계 (추가) ──────────────────────────
+    category_stats = {}
+    if not df.empty:
+        for category, group in df.groupby("category"):
+            total = len(group)
+            category_stats[category] = {
+                "total": total,
+                "vector_success_count": int(group["vector_success"].sum()),
+                "vector_success_rate": round(group["vector_success"].mean() * 100, 1),
+                "hybrid_success_count": int(group["hybrid_success"].sum()),
+                "hybrid_success_rate": round(group["hybrid_success"].mean() * 100, 1),
+            }
+
+    # 엑셀 저장 (category_stats 추가 전달)
+    _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp, category_stats)
 
     # 원본 json 저장
     with open(json_path, "w", encoding="utf-8") as f:
@@ -472,6 +533,7 @@ def run_evaluation():
         "elapsed_seconds": elapsed,
         "xlsx_path": xlsx_path,
         "json_path": json_path,
+        "category_stats": category_stats,
     }
 
     with open(summary_path, "w", encoding="utf-8") as f:
