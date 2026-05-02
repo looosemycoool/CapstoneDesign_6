@@ -282,6 +282,40 @@ def truncate_text(text, limit=1500):
         return text
     return text[:limit] + "...[truncated]"
 
+def llm_judge(question, ground_truth, generated_answer, module):
+    if not generated_answer or not ground_truth:
+        return False
+
+    prompt = f"""당신은 QA 평가자입니다.
+            아래 질문에 대한 정답과 AI가 생성한 답변을 비교하여,
+            생성된 답변이 정답의 핵심 내용을 올바르게 포함하고 있는지 판단하세요.
+
+            [질문]
+            {question}
+
+            [정답 (Ground Truth)]
+            {ground_truth}
+
+            [생성된 답변]
+            {generated_answer}
+
+            판단 기준:
+            - 정답의 핵심 사실이 생성된 답변에 포함되어 있으면 "correct"
+            - 핵심 사실이 빠져 있거나 틀린 정보가 있으면 "incorrect"
+
+            반드시 "correct" 또는 "incorrect" 중 하나만 출력하세요.
+            """
+    try:
+        response = module.upstage_client.chat.completions.create(
+            model="solar-pro",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        result = response.choices[0].message.content.strip().lower()
+        return result == "correct"
+    except Exception as e:
+        print(f"    [Judge 오류] {e}")
+        return False
 
 # ── 질문 1개 평가 ────────────────────────────────────────
 def evaluate_one(module, item, index):
@@ -324,8 +358,9 @@ def evaluate_one(module, item, index):
         vector_docs = vector_result.get("vector_docs", [])
         vector_summary = summarize_vector_docs(vector_docs)
 
-        row["vector_success"] = True
-        row["vector_answer"] = vector_result.get("answer", "")
+        vector_answer = vector_result.get("answer", "")
+        row["vector_answer"] = vector_answer
+        row["vector_success"] = llm_judge(question, ground_truth, vector_answer, module)
         row["vector_sources"] = vector_summary["sources"]
         row["vector_scored_sources"] = vector_summary["scored_sources"]
         row["vector_context_preview"] = truncate_text(vector_result.get("context", ""))
@@ -339,8 +374,9 @@ def evaluate_one(module, item, index):
         hybrid_summary = summarize_vector_docs(hybrid_docs)
         graph_summary = summarize_graph_relations(hybrid_result.get("graph_relations", []))
 
-        row["hybrid_success"] = True
-        row["hybrid_answer"] = hybrid_result.get("answer", "")
+        hybrid_answer = hybrid_result.get("answer", "")
+        row["hybrid_answer"] = hybrid_answer
+        row["hybrid_success"] = llm_judge(question, ground_truth, hybrid_answer, module)
         row["hybrid_sources"] = hybrid_summary["sources"]
         row["hybrid_scored_sources"] = hybrid_summary["scored_sources"]
         row["hybrid_graph_count"] = graph_summary["count"]
