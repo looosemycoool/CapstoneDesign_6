@@ -282,7 +282,7 @@ def truncate_text(text, limit=1500):
         return text
     return text[:limit] + "...[truncated]"
 
-def llm_judge(question, ground_truth, generated_answer, module):
+def llm_judge(question, ground_truth, generated_answer):
     if not generated_answer or not ground_truth:
         return False
 
@@ -306,13 +306,15 @@ def llm_judge(question, ground_truth, generated_answer, module):
             반드시 "correct" 또는 "incorrect" 중 하나만 출력하세요.
             """
     try:
-        response = module.upstage_client.chat.completions.create(
-            model="solar-pro",
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
         result = response.choices[0].message.content.strip().lower()
-        return result == "correct"
+        return "correct" in result and "incorrect" not in result
     except Exception as e:
         print(f"    [Judge 오류] {e}")
         return False
@@ -360,7 +362,7 @@ def evaluate_one(module, item, index):
 
         vector_answer = vector_result.get("answer", "")
         row["vector_answer"] = vector_answer
-        row["vector_success"] = llm_judge(question, ground_truth, vector_answer, module)
+        row["vector_success"] = llm_judge(question, ground_truth, vector_answer)
         row["vector_sources"] = vector_summary["sources"]
         row["vector_scored_sources"] = vector_summary["scored_sources"]
         row["vector_context_preview"] = truncate_text(vector_result.get("context", ""))
@@ -376,7 +378,7 @@ def evaluate_one(module, item, index):
 
         hybrid_answer = hybrid_result.get("answer", "")
         row["hybrid_answer"] = hybrid_answer
-        row["hybrid_success"] = llm_judge(question, ground_truth, hybrid_answer, module)
+        row["hybrid_success"] = llm_judge(question, ground_truth, hybrid_answer)
         row["hybrid_sources"] = hybrid_summary["sources"]
         row["hybrid_scored_sources"] = hybrid_summary["scored_sources"]
         row["hybrid_graph_count"] = graph_summary["count"]
