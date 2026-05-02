@@ -131,11 +131,11 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
             node_result = session.run("""
                 MATCH (n)
                 WHERE coalesce(n.name, '') CONTAINS $keyword
-                   OR coalesce(n.title, '') CONTAINS $keyword
-                   OR coalesce(n.file_name, '') CONTAINS $keyword
+                    OR coalesce(n.title, '') CONTAINS $keyword
+                    OR ANY(f IN coalesce(n.source_files, []) WHERE f CONTAINS $keyword)
                 RETURN
-                    coalesce(n.name, n.title, n.file_name, '') AS node_name,
-                    labels(n) AS labels
+                    elementId(n) AS node_id,
+                    coalesce(n.name, n.title, n.file_name, '') AS node_name
                 LIMIT $limit
             """, {
                 "keyword": keyword,
@@ -145,20 +145,21 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
             nodes = node_result.data()
 
             for node in nodes:
+                node_id = node.get("node_id")
                 node_name = (node.get("node_name") or "").strip()
-                if not node_name:
+                if not node_id or not node_name:
                     continue
 
                 # 정방향 관계
                 rel_result = session.run("""
                     MATCH (a)-[r]->(b)
-                    WHERE coalesce(a.name, a.title, a.file_name, '') = $node_name
+                    WHERE elementId(a) = $node_id
                     RETURN
                         coalesce(a.name, a.title, a.file_name, '') AS from_node,
                         type(r) AS rel,
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
-                """, {"node_name": node_name})
+                """, {"node_id": node_id})
 
                 for row in rel_result.data():
                     from_node = (row.get("from_node") or "").strip()
@@ -180,13 +181,13 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
                 # 역방향 관계
                 rev_result = session.run("""
                     MATCH (a)-[r]->(b)
-                    WHERE coalesce(b.name, b.title, b.file_name, '') = $node_name
+                    WHERE elementId(b) = $node_id
                     RETURN
                         coalesce(a.name, a.title, a.file_name, '') AS from_node,
                         type(r) AS rel,
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
-                """, {"node_name": node_name})
+                """, {"node_id": node_id})
 
                 for row in rev_result.data():
                     from_node = (row.get("from_node") or "").strip()
