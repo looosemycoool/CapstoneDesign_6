@@ -5,7 +5,7 @@ import chromadb
 from chromadb.config import Settings
 from neo4j import GraphDatabase
 from openai import OpenAI
-from langchain_openai import OpenAIEmbeddings
+from langchain_upstage import UpstageEmbeddings
 
 # ── 경로 / 환경변수 ─────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,19 +17,19 @@ load_dotenv(ENV_PATH)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # 실제 생성된 컬렉션 이름에 맞춤
-EXPERIMENT_ID = "openai_small"
+EXPERIMENT_ID = "upstage_pro"  # 6개 실험 중 하나로 설정
 COLLECTION_NAME = f"knu_cse_{EXPERIMENT_ID}"
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
 
 
 def get_embedding_function():
-    return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        api_key=OPENAI_API_KEY
+    return UpstageEmbeddings(
+        model="solar-embedding-1-large-passage",
+        api_key=UPSTAGE_API_KEY,
     )
 
 
@@ -53,7 +53,10 @@ def vector_search(query, n_results=3):
     embedding_fn = get_embedding_function()
     client = get_chroma_client()
 
-    existing_collections = client.list_collections()
+    existing_collections = [
+    c.name if hasattr(c, 'name') else c
+    for c in client.list_collections()
+    ]
     if COLLECTION_NAME not in existing_collections:
         raise ValueError(
             f"컬렉션이 없습니다: {COLLECTION_NAME} | 현재 컬렉션: {existing_collections}"
@@ -128,11 +131,11 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
             node_result = session.run("""
                 MATCH (n)
                 WHERE coalesce(n.name, '') CONTAINS $keyword
-                   OR coalesce(n.title, '') CONTAINS $keyword
-                   OR coalesce(n.file_name, '') CONTAINS $keyword
+                    OR coalesce(n.title, '') CONTAINS $keyword
+                    OR ANY(f IN coalesce(n.source_files, []) WHERE f CONTAINS $keyword)
                 RETURN
-                    coalesce(n.name, n.title, n.file_name, '') AS node_name,
-                    labels(n) AS labels
+                    elementId(n) AS node_id,
+                    coalesce(n.name, n.title, n.file_name, '') AS node_name
                 LIMIT $limit
             """, {
                 "keyword": keyword,
@@ -142,20 +145,21 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
             nodes = node_result.data()
 
             for node in nodes:
+                node_id = node.get("node_id")
                 node_name = (node.get("node_name") or "").strip()
-                if not node_name:
+                if not node_id or not node_name:
                     continue
 
                 # 정방향 관계
                 rel_result = session.run("""
                     MATCH (a)-[r]->(b)
-                    WHERE coalesce(a.name, a.title, a.file_name, '') = $node_name
+                    WHERE elementId(a) = $node_id
                     RETURN
                         coalesce(a.name, a.title, a.file_name, '') AS from_node,
                         type(r) AS rel,
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
-                """, {"node_name": node_name})
+                """, {"node_id": node_id})
 
                 for row in rel_result.data():
                     from_node = (row.get("from_node") or "").strip()
@@ -177,13 +181,13 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
                 # 역방향 관계
                 rev_result = session.run("""
                     MATCH (a)-[r]->(b)
-                    WHERE coalesce(b.name, b.title, b.file_name, '') = $node_name
+                    WHERE elementId(b) = $node_id
                     RETURN
                         coalesce(a.name, a.title, a.file_name, '') AS from_node,
                         type(r) AS rel,
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
-                """, {"node_name": node_name})
+                """, {"node_id": node_id})
 
                 for row in rev_result.data():
                     from_node = (row.get("from_node") or "").strip()
@@ -229,8 +233,10 @@ def merge_results(vector_docs, graph_relations):
 
 
 # ── LLM 답변 생성 ─────────────────────────────────────────
-def generate_answer(query, context, model="gpt-4o-mini"):
+def generate_answer(query, context, model="solar-pro"):
     """컨텍스트 기반 LLM 답변 생성"""
+    if not context.strip():
+        return "해당 정보를 찾을 수 없습니다."
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
 아래 검색된 문서 내용과 그래프 관계 정보를 바탕으로 질문에 답변하세요.
 반드시 검색 결과에 근거해서만 답변하세요.
@@ -245,7 +251,7 @@ def generate_answer(query, context, model="gpt-4o-mini"):
 [답변]
 """
 
-    response = openai_client.chat.completions.create(
+    response = upstage_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2
@@ -266,21 +272,31 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
     graph_relations = []
 
     if use_vector:
-        vector_docs = vector_search(query, n_results=3)
-        if verbose:
-            print(f"\n[Vector 검색] {len(vector_docs)}개 문서 검색됨")
-            for doc in vector_docs:
-                print(f"  - {doc['source']} (유사도: {doc['score']})")
+        try:
+            vector_docs = vector_search(query, n_results=3)
+            if verbose:
+                print(f"\n[Vector 검색] {len(vector_docs)}개 문서 검색됨")
+                for doc in vector_docs:
+                    print(f"  - {doc['source']} (유사도: {doc['score']})")
+        except Exception as e:
+            if verbose:
+                print(f"\n[Vector 검색 오류] {e}")
+            vector_docs = []
 
     if use_graph:
-        graph_relations = graph_search(query)
-        if verbose:
-            print(f"\n[Graph 검색] {len(graph_relations)}개 관계 탐색됨")
-            for rel in graph_relations[:5]:
-                print(f"  - {rel['from']} --[{rel['relation']}]--> {rel['to']}")
+        try:
+            graph_relations = graph_search(query)
+            if verbose:
+                print(f"\n[Graph 검색] {len(graph_relations)}개 관계 탐색됨")
+                for rel in graph_relations[:5]:
+                    print(f"  - {rel['from']} --[{rel['relation']}]--> {rel['to']}")
+        except Exception as e:
+            if verbose:
+                print(f"\n[Graph 검색 오류] {e}")
+            graph_relations = []
 
     context = merge_results(vector_docs, graph_relations)
-    answer = generate_answer(query, context)
+    answer = generate_answer(query, context, model = "solar-pro")
 
     if verbose:
         print(f"\n[최종 답변]\n{answer}")
@@ -303,7 +319,7 @@ def vector_only_rag(query, verbose=True):
 
     vector_docs = vector_search(query, n_results=3)
     context = merge_results(vector_docs, [])
-    answer = generate_answer(query, context)
+    answer = generate_answer(query, context, model = "solar-pro")
 
     if verbose:
         print(f"\n[Vector Only 답변]\n{answer}")

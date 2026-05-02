@@ -15,10 +15,10 @@ load_dotenv(ENV_PATH)
 NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-EXTRACT_MODEL = "gpt-4o-mini"   # 개체·관계 추출 및 노드 통합에 사용
+upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
+EXTRACT_MODEL = "solar-pro"   # 개체·관계 추출 및 노드 통합에 사용
 
 
 # ── Neo4j 드라이버 ────────────────────────────────────────
@@ -74,11 +74,11 @@ def safe_json_load(text: str):
     return json.loads(text)
 
 
-# ── Step 1: 개체·관계 자동 추출 (GPT-4o-mini, 동적 스키마) ──────
+# ── Step 1: 개체·관계 자동 추출 (solar-pro, 동적 스키마) ──────
 def extract_entities_and_relations(file_name: str, text: str) -> dict:
-    """GPT-4o-mini를 사용해 문서에서 개체·관계를 동적으로 추출 (스키마 고정 없음)"""
+    """solar-pro를 사용해 문서에서 개체·관계를 동적으로 추출 (스키마 고정 없음)"""
     prompt = f"""당신은 대학 행정 문서에서 지식 그래프를 구축하는 전문가입니다.
-아래 경북대학교 컴퓨터학부 문서를 읽고, 의미 있는 개체(노드)와 개체 간 관계(엣지)를 추출하세요.
+아래 경북대학교 문서를 읽고, 의미 있는 개체(노드)와 개체 간 관계(엣지)를 추출하세요.
 
 파일명: {file_name}
 문서 내용:
@@ -86,7 +86,8 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 
 ## 추출 규칙
 - 스키마를 고정하지 말고, 문서 내용에서 자연스럽게 나타나는 개념을 개체 타입으로 사용하세요.
-- 개체 타입은 짧고 명확한 영문 명사로 작성하세요 (예: Scholarship, GraduationRequirement, Course, Deadline, Department, Program, Student, Condition, Schedule, Rule).
+- 개체 타입은 문서에서 자연스럽게 드러나는 개념을 직접 반영한 짧고 명확한 영문 명사로 자유롭게 정하세요.
+- 미리 정해진 타입 목록은 없습니다. 문서 내용에 가장 잘 맞는 타입을 스스로 선택하세요.
 - 비슷한 의미의 개체는 하나로 통합하세요 (예: "졸업요건"과 "졸업 요건"은 동일 개체).
 - 날짜, 금액, URL, 자격 요건, 학점 등 세부적인 정보는 새로운 노드로 쪼개지 마세요. 반드시 관련 핵심 개체의 'properties' 목록에 key-value 형태로 깔끔하게 저장하세요.
 - 관계 타입은 동사 형태의 영문 대문자로 작성하세요 (예: REQUIRES, HAS_DEADLINE, PART_OF, APPLIES_TO, RELATED_TO, HAS_CONDITION, BELONGS_TO, OFFERS, TARGETS).
@@ -117,9 +118,9 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 }}"""
 
     try:
-        response = openai_client.chat.completions.create(
+        response = upstage_client.chat.completions.create(
             model=EXTRACT_MODEL,
-            max_tokens=2048,
+            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
         )
         result = response.choices[0].message.content.strip()
@@ -138,11 +139,11 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
         return {"entities": entities, "relations": relations}
 
     except Exception as e:
-        print(f"  [OpenAI 오류] {e}")
+        print(f"  [Upstage 오류] {e}")
         return {"entities": [], "relations": []}
 
 
-# ── Step 2: 유사 노드 통합 (GPT-4o-mini) ──────────────────────
+# ── Step 2: 유사 노드 통합 (solar-pro) ──────────────────────
 def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
     """전체 노드 목록에서 의미가 유사한 노드를 하나의 대표 이름으로 통합.
     반환: {원본 이름 → 대표 이름} 매핑"""
@@ -174,7 +175,7 @@ def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
 }}"""
 
     try:
-        response = openai_client.chat.completions.create(
+        response = upstage_client.chat.completions.create(
             model=EXTRACT_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
@@ -212,14 +213,7 @@ def consolidate_nodes(all_node_names: list[str]) -> dict[str, str]:
 
 
 # ── Neo4j 저장 ───────────────────────────────────────────
-def create_document_node(session, file_name: str):
-    session.run("""
-        MERGE (d:Document {file_name: $file_name})
-        SET d.name = $file_name, d.title = $file_name
-    """, {"file_name": file_name})
-
-
-def upsert_entity(session, name: str, etype: str, props) -> str | None:
+def upsert_entity(session, name: str, etype: str, props, file_name: str = "") -> str | None:
     name = str(name).strip()
     if not name:
         return None
@@ -250,8 +244,17 @@ def upsert_entity(session, name: str, etype: str, props) -> str | None:
             safe_props[key] = "" if v is None else str(v)
 
     session.run(
-        f"MERGE (e:`{label}` {{name: $name}}) SET e += $props",
-        {"name": name, "props": safe_props}
+        f"""
+        MERGE (e:`{label}` {{name: $name}})
+        SET e += $props
+        SET e.source_files = 
+            CASE
+                WHEN $file_name IN coalesce(e.source_files, [])
+                THEN e.source_files
+                ELSE coalesce(e.source_files, []) + $file_name
+            END
+        """,
+        {"name": name, "props": safe_props, "file_name": file_name}
     )
     return name
 
@@ -271,8 +274,8 @@ def create_relation(session, from_name: str, to_name: str, rel_type: str):
 # ── 전체 그래프 구축 ─────────────────────────────────────
 def build_graph():
     """전체 그래프 구축
-    1단계: GPT-4o-mini로 각 문서에서 개체·관계 동적 추출
-    2단계: GPT-4o-mini로 전체 노드에서 유사 노드 통합 후 Neo4j 저장
+    1단계: solar-pro로 각 문서에서 개체·관계 동적 추출
+    2단계: solar-pro로 전체 노드에서 유사 노드 통합 후 Neo4j 저장
     """
     manual_path = os.path.join(PARSED_DIR, "manual_parsed.json")
     if not os.path.exists(manual_path):
@@ -285,7 +288,7 @@ def build_graph():
     driver = get_driver()
     clear_db(driver)
 
-    print(f"[시작] Graph DB 구축 ({len(manual_files)}개 파일) — GPT-4o-mini 동적 추출 모드")
+    print(f"[시작] Graph DB 구축 ({len(manual_files)}개 파일) — solar-pro 동적 추출 모드")
 
     # ── 1단계: 문서별 개체·관계 추출 및 저장 ──────────────
     all_entity_names = []       # 통합 대상 수집용
@@ -316,24 +319,38 @@ def build_graph():
 
     # ── 2단계: 전체 노드 이름 중복 제거 후 유사 노드 통합 ──
     unique_names = list(dict.fromkeys(all_entity_names))  # 순서 유지 중복 제거
-    print(f"\n[노드 통합] 고유 개체명 {len(unique_names)}개 → GPT-4o-mini 유사도 분석 중...")
+    print(f"\n[노드 통합] 고유 개체명 {len(unique_names)}개 → solar-pro 유사도 분석 중...")
 
     # 노드가 많으면 배치로 나눠 처리
     BATCH = 80
     name_mapping: dict[str, str] = {}
+
+    # 1차 배치별 통합
     for start in range(0, len(unique_names), BATCH):
         batch_names = unique_names[start:start + BATCH]
         batch_map = consolidate_nodes(batch_names)
         name_mapping.update(batch_map)
         print(f"  배치 {start//BATCH + 1}: {len(batch_names)}개 처리 완료")
+    
+    # 2차 교차 통합
+    canonical_names = list(dict.fromkeys(name_mapping.values()))
+    print(f"\n[교차 통합] 1차 대표 이름 {len(canonical_names)}개 -> 최종 통합 중...")
 
+    if len(canonical_names) > 1:
+        final_map = consolidate_nodes(canonical_names)
+
+        # 원본 이름 -> 1차 대표 -> 최종 대표로 이어지도록 재매핑
+        name_mapping = {
+            orig: final_map.get(canonical, canonical)
+            for orig, canonical in name_mapping.items()
+        }
+        print(f"  최종 대표 이름 {len(set(name_mapping.values()))}개로 통합 완료")
+    
     # ── 3단계: 매핑 적용 후 Neo4j 저장 ────────────────────
     print("\n[저장] Neo4j에 노드·관계 저장 중...")
 
     with driver.session() as session:
         for file_name, extracted in extraction_results:
-            create_document_node(session, file_name)
-
             valid_names = set()
 
             for entity in extracted.get("entities", []):
@@ -342,15 +359,9 @@ def build_graph():
                     continue
                 # 통합된 대표 이름으로 교체
                 canonical = name_mapping.get(raw_name, raw_name)
-                created = upsert_entity(session, canonical, entity.get("type", "Entity"), entity.get("properties", {}))
+                created = upsert_entity(session, canonical, entity.get("type", "Entity"), entity.get("properties", {}), file_name)
                 if created:
                     valid_names.add(canonical)
-
-                    session.run("""
-                        MATCH (d:Document {file_name: $file_name})
-                        MATCH (e {name: $name})
-                        MERGE (d)-[:MENTIONS]->(e)
-                    """, {"file_name": file_name, "name": canonical})
 
             for rel in extracted.get("relations", []):
                 from_raw = str(rel.get("from", "")).strip()
@@ -392,10 +403,10 @@ def search_graph(keyword: str):
             MATCH (n)-[r]->(m)
             WHERE coalesce(n.name, '') CONTAINS $keyword
                 OR coalesce(n.title, '') CONTAINS $keyword
-                OR coalesce(n.file_name, '') CONTAINS $keyword
+                OR ANY(f IN coalesce(n.source_files, []) WHERE f CONTAINS $keyword)
                 OR coalesce(m.name, '') CONTAINS $keyword
                 OR coalesce(m.title, '') CONTAINS $keyword
-                OR coalesce(m.file_name, '') CONTAINS $keyword
+                OR ANY(f IN coalesce(m.source_files, []) WHERE f CONTAINS $keyword)
             RETURN
                 coalesce(n.name, n.title, n.file_name, '') AS from_node,
                 type(r) AS rel,
