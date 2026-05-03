@@ -113,6 +113,41 @@ def safe_json_load(text: str):
     return json.loads(text)
 
 
+# ── Step 0: 문서 핵심 요약 (solar-pro) ─────────────────────
+def summarize_document(file_name: str, text: str, max_sentences: int = 8) -> str:
+    """문서를 핵심 문장 몇 개로 요약해 그래프 추출에 쓸 압축 텍스트를 반환한다.
+    텍스트가 짧으면 그대로 반환한다."""
+    if len(text) <= 1000:
+        return text
+
+    prompt = f"""당신은 대학 행정 문서에서 지식 그래프 구축에 필요한 핵심 정보를 추려내는 전문가입니다.
+아래 문서를 읽고, 개체(사람·조직·제도·과목·날짜·금액 등)와 개체 간 관계를 파악할 수 있는 핵심 문장을 최대 {max_sentences}개만 추출하세요.
+
+파일명: {file_name}
+문서 전체:
+{text[:6000]}
+
+## 요약 규칙
+- 구체적인 수치(학점, 금액, 날짜, 인원 등)는 반드시 포함하세요.
+- 자격 요건, 신청 방법, 혜택, 대상 등 핵심 조건을 보존하세요.
+- 중복되거나 부가적인 설명은 제거하세요.
+- 원문의 표현을 최대한 그대로 사용하고, 문장 형태로 출력하세요.
+- JSON이나 다른 형식 없이 핵심 문장만 줄바꿈으로 구분해 출력하세요."""
+
+    try:
+        response = upstage_client.chat.completions.create(
+            model=EXTRACT_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary = response.choices[0].message.content.strip()
+        print(f"  [요약] {len(text)}자 → {len(summary)}자 ({max_sentences}문장 이내)")
+        return summary
+    except Exception as e:
+        print(f"  [요약 오류] {e} — 원문 앞부분 사용")
+        return text[:3000]
+
+
 # ── Step 1: 개체·관계 자동 추출 (solar-pro, 동적 스키마) ──────
 def extract_entities_and_relations(file_name: str, text: str) -> dict:
     """solar-pro를 사용해 문서에서 개체·관계를 동적으로 추출 (스키마 고정 없음)"""
@@ -121,7 +156,7 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
 
 파일명: {file_name}
 문서 내용:
-{text[:3000]}
+{text}
 
 ## 추출 규칙
 - 스키마를 고정하지 말고, 문서 내용에서 자연스럽게 나타나는 개념을 개체 타입으로 사용하세요.
@@ -412,7 +447,8 @@ def build_graph():
 
             print(f"\n[{i + 1}/{len(manual_files)}] {file_name[:60]}")
 
-            extracted = extract_entities_and_relations(file_name, parsed_text)
+            summary_text = summarize_document(file_name, parsed_text)
+            extracted = extract_entities_and_relations(file_name, summary_text)
 
             entities_count = len(extracted.get("entities", []))
             relations_count = len(extracted.get("relations", []))
