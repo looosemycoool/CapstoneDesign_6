@@ -316,15 +316,10 @@ def upsert_entity(session, name: str, etype: str, props, file_name: str = "") ->
         raw_items = []
         for item in props:
             if isinstance(item, dict):
-<<<<<<< HEAD
                 # {"key": "amount", "value": "100"} 형태인 경우
                 if "key" in item and "value" in item:
                     raw_items.append((item["key"], item["value"]))
                 # {"amount": "100"} 형태가 리스트에 들어있는 경우
-=======
-                if "key" in item and "value" in item:
-                    raw_items.append((item["key"], item["value"]))
->>>>>>> 038fb8e6ed229da88a71740e41a3da17026e72e6
                 else:
                     raw_items.extend(item.items())
     else:
