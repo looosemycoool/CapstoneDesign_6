@@ -263,7 +263,7 @@ def merge_results(vector_docs, graph_relations):
                     rel_label += f" {{{rel['rel_props']}}}"
 
                 graph_text += f"- {from_label} --[{rel_label}]--> {to_label}\n"
-                context_parts.append(graph_text.strip())
+        context_parts.append(graph_text.strip())
 
     return "\n\n".join(context_parts).strip()
 
