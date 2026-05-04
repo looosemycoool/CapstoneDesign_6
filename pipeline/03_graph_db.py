@@ -245,7 +245,8 @@ def upsert_entity(session, name: str, etype: str, props, file_name: str = "") ->
 
     session.run(
         f"""
-        MERGE (e:`{label}` {{name: $name}})
+        MERGE (e {{name: $name}})
+        SET e:`{label}`
         SET e += $props
         SET e.source_files = 
             CASE
