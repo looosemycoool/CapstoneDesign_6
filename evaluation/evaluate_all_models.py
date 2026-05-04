@@ -23,6 +23,7 @@ Vector Only / Hybrid 성능을 비교 평가합니다.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -405,14 +406,64 @@ def summarize_graph_relations(graph_relations, max_preview=10):
     }
 
 
+# ── LLM-as-judge: 답변 정답 여부 채점 ─────────────────────
+def get_judge_llm():
+    """채점용 LLM (기본 Upstage solar-pro).
+    환경변수 EVAL_JUDGE_MODEL 로 모델 변경 가능 (예: solar-mini).
+    """
+    from langchain_upstage import ChatUpstage
+    model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
+    return ChatUpstage(model=model, temperature=0)
+
+
+def judge_answer(question, ground_truth, predicted, judge_llm):
+    """LLM 으로 답변이 ground_truth 와 의미상 일치하는지 판단.
+    반환: (verdict, reason). verdict ∈ {"correct", "incorrect", "skipped", "error"}.
+    """
+    if not predicted or not str(predicted).strip():
+        return "incorrect", "답변 없음"
+    if not ground_truth or not str(ground_truth).strip():
+        return "skipped", "정답(ground_truth) 미제공"
+    prompt = (
+        "아래 RAG 챗봇 답변이 정답과 의미상 일치하는지 판단하세요.\n"
+        "사소한 표현 차이는 일치로 보고, 핵심 사실(날짜/금액/조건/대상/링크 등)이 "
+        "다르거나 누락되면 불일치로 판단하세요.\n\n"
+        f"질문: {question}\n"
+        f"정답: {ground_truth}\n"
+        f"답변: {predicted}\n\n"
+        "다음 JSON 한 줄로만 답하세요:\n"
+        '{"verdict": "correct" 또는 "incorrect", "reason": "한 문장"}'
+    )
+    try:
+        raw = judge_llm.invoke(prompt).content.strip()
+        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                v = str(obj.get("verdict", "")).strip().lower()
+                rsn = str(obj.get("reason", "")).strip()
+                if v in ("correct", "incorrect"):
+                    return v, rsn
+            except json.JSONDecodeError:
+                pass
+        low = raw.lower()
+        if "incorrect" in low:
+            return "incorrect", raw[:200]
+        if "correct" in low:
+            return "correct", raw[:200]
+        return "error", f"파싱 실패: {raw[:200]}"
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+
+
 # ── 질문 1개 평가 ─────────────────────────────────────────
-def evaluate_one(item, index, experiment, hybrid_module):
+def evaluate_one(item, index, experiment, hybrid_module, judge_llm=None):
     question = extract_question(item)
     qid = extract_id(item, index)
     category = extract_category(item)
     ground_truth = extract_ground_truth(item)
 
-    # [수정⑤] vector_success를 처음부터 문자열로 초기화
+    # vector_success / hybrid_success 는 이제 "정답" / "오답" (judge LLM 결과 또는 fallback)
     row = {
         "id": qid,
         "category": category,
@@ -424,14 +475,18 @@ def evaluate_one(item, index, experiment, hybrid_module):
         "embedding_model": experiment["embedding_model"],
         "llm_model": experiment["llm_model"],
 
-        "vector_success": "실패",
+        "vector_success": "오답",
+        "vector_judge_verdict": "skipped",
+        "vector_judge_reason": "",
         "vector_answer": "",
         "vector_sources": "",
         "vector_scored_sources": "",
         "vector_context_preview": "",
         "vector_error": "",
 
-        "hybrid_success": "실패",
+        "hybrid_success": "오답",
+        "hybrid_judge_verdict": "skipped",
+        "hybrid_judge_reason": "",
         "hybrid_answer": "",
         "hybrid_sources": "",
         "hybrid_scored_sources": "",
@@ -446,7 +501,7 @@ def evaluate_one(item, index, experiment, hybrid_module):
         row["hybrid_error"] = "질문 없음"
         return row
 
-    # ── [수정③] Vector 검색 1번만 수행 후 두 블록에서 공유 ──
+    # Vector 검색 1번만 수행 후 두 블록에서 공유
     v_docs = None
     v_search_error = None
     try:
@@ -454,23 +509,38 @@ def evaluate_one(item, index, experiment, hybrid_module):
     except Exception as e:
         v_search_error = f"{type(e).__name__}: {e}"
 
-    # ── Vector Only ───────────────────────────────────────
+    # ── Vector Only — 실행 ────────────────────────────────
+    vector_answer = ""
     try:
         if v_docs is None:
             raise RuntimeError(v_search_error or "Vector 검색 실패")
         context = merge_results(v_docs, [])
-        answer = generate_answer(question, context, experiment)
+        vector_answer = generate_answer(question, context, experiment)
         v_sum = summarize_vector_docs(v_docs)
 
-        row["vector_success"] = "성공"
-        row["vector_answer"] = answer
+        row["vector_answer"] = vector_answer
         row["vector_sources"] = v_sum["sources"]
         row["vector_scored_sources"] = v_sum["scored_sources"]
         row["vector_context_preview"] = truncate_text(context)
     except Exception as e:
         row["vector_error"] = f"{type(e).__name__}: {e}"
 
-    # ── Hybrid (Vector + Graph) ───────────────────────────
+    # Vector — 채점
+    if row["vector_error"]:
+        row["vector_judge_verdict"] = "error"
+        row["vector_judge_reason"] = "파이프라인 오류"
+    elif judge_llm is not None:
+        verdict, reason = judge_answer(question, ground_truth, vector_answer, judge_llm)
+        row["vector_judge_verdict"] = verdict
+        row["vector_judge_reason"] = reason
+        row["vector_success"] = "정답" if verdict == "correct" else "오답"
+    else:
+        # judge LLM 미설정: fallback (실행 성공 = 정답으로 처리)
+        row["vector_success"] = "정답"
+        row["vector_judge_reason"] = "judge 미설정"
+
+    # ── Hybrid (Vector + Graph) — 실행 ────────────────────
+    hybrid_answer = ""
     try:
         if v_docs is None:
             raise RuntimeError(v_search_error or "Vector 검색 실패")
@@ -480,12 +550,11 @@ def evaluate_one(item, index, experiment, hybrid_module):
             label="Graph 검색(Neo4j)",
         )
         context = merge_results(v_docs, graph_rels)
-        answer = generate_answer(question, context, experiment)
+        hybrid_answer = generate_answer(question, context, experiment)
         v_sum = summarize_vector_docs(v_docs)
         g_sum = summarize_graph_relations(graph_rels)
 
-        row["hybrid_success"] = "성공"
-        row["hybrid_answer"] = answer
+        row["hybrid_answer"] = hybrid_answer
         row["hybrid_sources"] = v_sum["sources"]
         row["hybrid_scored_sources"] = v_sum["scored_sources"]
         row["hybrid_graph_count"] = g_sum["count"]
@@ -494,11 +563,24 @@ def evaluate_one(item, index, experiment, hybrid_module):
     except Exception as e:
         row["hybrid_error"] = f"{type(e).__name__}: {e}"
 
+    # Hybrid — 채점
+    if row["hybrid_error"]:
+        row["hybrid_judge_verdict"] = "error"
+        row["hybrid_judge_reason"] = "파이프라인 오류"
+    elif judge_llm is not None:
+        verdict, reason = judge_answer(question, ground_truth, hybrid_answer, judge_llm)
+        row["hybrid_judge_verdict"] = verdict
+        row["hybrid_judge_reason"] = reason
+        row["hybrid_success"] = "정답" if verdict == "correct" else "오답"
+    else:
+        row["hybrid_success"] = "정답"
+        row["hybrid_judge_reason"] = "judge 미설정"
+
     return row
 
 
 # ── 실험 1개 전체 평가 ────────────────────────────────────
-def run_experiment(experiment, dataset, hybrid_module, timestamp):
+def run_experiment(experiment, dataset, hybrid_module, timestamp, judge_llm=None):
     label = experiment["label"]
     exp_id = experiment["id"]
     rows = []
@@ -512,7 +594,7 @@ def run_experiment(experiment, dataset, hybrid_module, timestamp):
         print(f"  [{idx + 1:>3}/{len(dataset)}] {question[:65]}")
 
         try:
-            row = evaluate_one(item, idx, experiment, hybrid_module)
+            row = evaluate_one(item, idx, experiment, hybrid_module, judge_llm)
         except Exception as e:
             row = {
                 "id": extract_id(item, idx),
@@ -524,19 +606,25 @@ def run_experiment(experiment, dataset, hybrid_module, timestamp):
                 "provider": experiment["provider"],
                 "embedding_model": experiment["embedding_model"],
                 "llm_model": experiment["llm_model"],
-                "vector_success": "실패", "vector_answer": "",
+                "vector_success": "오답",
+                "vector_judge_verdict": "error",
+                "vector_judge_reason": "평가 핸들러 오류",
+                "vector_answer": "",
                 "vector_sources": "", "vector_scored_sources": "",
                 "vector_context_preview": "",
                 "vector_error": f"Unhandled: {type(e).__name__}: {e}",
-                "hybrid_success": "실패", "hybrid_answer": "",
+                "hybrid_success": "오답",
+                "hybrid_judge_verdict": "error",
+                "hybrid_judge_reason": "평가 핸들러 오류",
+                "hybrid_answer": "",
                 "hybrid_sources": "", "hybrid_scored_sources": "",
                 "hybrid_graph_count": 0, "hybrid_graph_preview": "",
                 "hybrid_context_preview": "",
                 "hybrid_error": f"Unhandled: {type(e).__name__}: {e}",
             }
 
-        v_ok = row["vector_success"] == "성공"
-        h_ok = row["hybrid_success"] == "성공"
+        v_ok = row["vector_success"] == "정답"
+        h_ok = row["hybrid_success"] == "정답"
         print(
             f"         Vector: {'✓' if v_ok else '✗'}"
             f" | Hybrid: {'✓' if h_ok else '✗'}"
@@ -556,15 +644,19 @@ def run_experiment(experiment, dataset, hybrid_module, timestamp):
     return rows
 
 
-# ── [수정②] 실험별 성공률 계산 (문자열 기준) ─────────────
+# ── 실험별 정답률 계산 ───────────────────────────────────
 def compute_summary(experiment, rows, elapsed):
     total = len(rows)
-    v_success = sum(1 for r in rows if r.get("vector_success") == "성공")
-    h_success = sum(1 for r in rows if r.get("hybrid_success") == "성공")
+    v_correct = sum(1 for r in rows if r.get("vector_success") == "정답")
+    h_correct = sum(1 for r in rows if r.get("hybrid_success") == "정답")
     avg_graph = (
         sum(r.get("hybrid_graph_count", 0) for r in rows) / total
         if total > 0 else 0.0
     )
+
+    def _count_verdict(field, target):
+        return sum(1 for r in rows if r.get(field) == target)
+
     return {
         "experiment_id": experiment["id"],
         "experiment_label": experiment["label"],
@@ -572,10 +664,16 @@ def compute_summary(experiment, rows, elapsed):
         "embedding_model": experiment["embedding_model"],
         "llm_model": experiment["llm_model"],
         "total_questions": total,
-        "vector_success_count": v_success,
-        "hybrid_success_count": h_success,
-        "vector_success_rate(%)": round(v_success / total * 100, 1) if total > 0 else 0.0,
-        "hybrid_success_rate(%)": round(h_success / total * 100, 1) if total > 0 else 0.0,
+        "vector_success_count": v_correct,  # 키 이름 호환을 위해 유지 (= 정답 수)
+        "hybrid_success_count": h_correct,
+        "vector_success_rate(%)": round(v_correct / total * 100, 1) if total > 0 else 0.0,
+        "hybrid_success_rate(%)": round(h_correct / total * 100, 1) if total > 0 else 0.0,
+        "vector_incorrect_count": _count_verdict("vector_judge_verdict", "incorrect"),
+        "vector_skipped_count": _count_verdict("vector_judge_verdict", "skipped"),
+        "vector_error_count": _count_verdict("vector_judge_verdict", "error"),
+        "hybrid_incorrect_count": _count_verdict("hybrid_judge_verdict", "incorrect"),
+        "hybrid_skipped_count": _count_verdict("hybrid_judge_verdict", "skipped"),
+        "hybrid_error_count": _count_verdict("hybrid_judge_verdict", "error"),
         "avg_graph_count": round(avg_graph, 2),
         "elapsed_seconds": elapsed,
     }
@@ -636,7 +734,7 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
 
     # ── ① 요약 시트 ──────────────────────────────────────
     ws = wb.create_sheet("① 요약")
-    headers = ["모델", "임베딩", "LLM", "Vector 성공률", "Hybrid 성공률", "평균 Graph 수", "소요(분)"]
+    headers = ["모델", "임베딩", "LLM", "Vector 정답률", "Hybrid 정답률", "평균 Graph 수", "소요(분)"]
     ws.append(headers)
     for s in experiment_summaries:
         ws.append([
@@ -672,16 +770,16 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
             matched  = next((r for r in exp_rows if r["id"] == qid), None)
             if matched:
                 answers.append(matched.get("vector_answer", ""))
-                successes.append(matched.get("vector_success", "실패"))
+                successes.append(matched.get("vector_success", "오답"))
             else:
                 answers.append("데이터 없음")
-                successes.append("실패")
+                successes.append("오답")
         ws.append([qid, category, question, gt] + answers)
-        # 성공/실패 배경색
+        # 정답/오답 배경색
         row_idx = i + 2
         for col_offset, success in enumerate(successes):
             cell = ws.cell(row=row_idx, column=ans_col_start + col_offset)
-            cell.fill = C["success"] if success == "성공" else C["fail"]
+            cell.fill = C["success"] if success == "정답" else C["fail"]
             cell.alignment = AL_TL
             cell.font = F["normal"]
 
@@ -709,17 +807,17 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
             matched  = next((r for r in exp_rows if r["id"] == qid), None)
             if matched:
                 cells_data += [matched.get("hybrid_answer", ""), matched.get("hybrid_graph_count", 0)]
-                successes.append(matched.get("hybrid_success", "실패"))
+                successes.append(matched.get("hybrid_success", "오답"))
             else:
                 cells_data += ["데이터 없음", 0]
-                successes.append("실패")
+                successes.append("오답")
         ws.append([qid, category, question, gt] + cells_data)
         row_idx = i + 2
         for col_offset, success in enumerate(successes):
             ans_cell   = ws.cell(row=row_idx, column=5 + col_offset * 2)
             graph_cell = ws.cell(row=row_idx, column=6 + col_offset * 2)
-            ans_cell.fill   = C["success"] if success == "성공" else C["fail"]
-            graph_cell.fill = C["success"] if success == "성공" else C["fail"]
+            ans_cell.fill   = C["success"] if success == "정답" else C["fail"]
+            graph_cell.fill = C["success"] if success == "정답" else C["fail"]
             ans_cell.alignment   = AL_TL
             graph_cell.alignment = AL_TC
             ans_cell.font   = F["normal"]
@@ -735,11 +833,13 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
         ("분류",        "category"),
         ("질문",        "question"),
         ("정답",        "ground_truth"),
-        ("Vector 성공", "vector_success"),
+        ("Vector 정답", "vector_success"),
         ("Vector 답변", "vector_answer"),
+        ("Vector 사유", "vector_judge_reason"),
         ("Vector 오류", "vector_error"),
-        ("Hybrid 성공", "hybrid_success"),
+        ("Hybrid 정답", "hybrid_success"),
         ("Hybrid 답변", "hybrid_answer"),
+        ("Hybrid 사유", "hybrid_judge_reason"),
         ("Graph 수",    "hybrid_graph_count"),
         ("Hybrid 오류", "hybrid_error"),
     ]
@@ -759,9 +859,9 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
             ws.append([r.get(k, "") for k in detail_keys])
 
         _fmt_sheet(ws, C["h_blue"], F, AL_C, AL_TL,
-                   col_widths=[6, 10, 40, 30, 10, 40, 25, 10, 40, 8, 25],
+                   col_widths=[6, 10, 40, 30, 10, 40, 25, 25, 10, 40, 25, 8, 25],
                    freeze="E2",
-                   success_col=[5, 8],  # Vector성공, Hybrid성공 열 (1-based)
+                   success_col=[5, 9],  # Vector 정답, Hybrid 정답 열 (1-based)
                    q_col=3)
 
     wb.save(xlsx_path)
@@ -787,12 +887,12 @@ def _fmt_sheet(ws, header_fill, F, AL_C, AL_TL,
         for col_idx, cell in enumerate(row, start=1):
             cell.font      = F["normal"]
             cell.alignment = AL_TL
-            # 성공/실패 셀 색상 (지정된 열만)
+            # 정답/오답 셀 색상 (지정된 열만)
             if success_col and col_idx in success_col:
-                if cell.value == "성공":
+                if cell.value == "정답":
                     cell.fill      = SUCCESS_FILL
                     cell.alignment = Alignment(horizontal="center", vertical="top")
-                elif cell.value == "실패":
+                elif cell.value == "오답":
                     cell.fill      = FAIL_FILL
                     cell.alignment = Alignment(horizontal="center", vertical="top")
             # 질문 열 배경
@@ -826,6 +926,16 @@ def run_all_evaluation():
     print(f"  총 질문 수  : {len(dataset)}개")
     print(f"  총 평가 수  : {len(EXPERIMENTS) * len(dataset)}개 (실험 × 질문)")
 
+    # LLM-as-judge: 답변이 ground_truth 와 의미상 일치하는지 채점
+    try:
+        judge_llm = get_judge_llm()
+        judge_model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
+        print(f"  Judge LLM   : {judge_model} (Upstage)")
+    except Exception as e:
+        judge_llm = None
+        print(f"  Judge LLM 사용 불가 ({type(e).__name__}: {e})")
+        print(f"     → 정답 비교 없이 진행. 'success'는 실행 성공만 의미.")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_rows = []
     experiment_summaries = []
@@ -833,7 +943,7 @@ def run_all_evaluation():
 
     for experiment in EXPERIMENTS:
         exp_start = time.time()
-        rows = run_experiment(experiment, dataset, hybrid_module, timestamp)
+        rows = run_experiment(experiment, dataset, hybrid_module, timestamp, judge_llm)
         exp_elapsed = round(time.time() - exp_start, 2)
 
         all_rows.extend(rows)
@@ -841,8 +951,20 @@ def run_all_evaluation():
         experiment_summaries.append(summary)
 
         print(f"\n  ▶ {experiment['label']}")
-        print(f"    Vector : {summary['vector_success_count']}/{summary['total_questions']} ({summary['vector_success_rate(%)']}%)")
-        print(f"    Hybrid : {summary['hybrid_success_count']}/{summary['total_questions']} ({summary['hybrid_success_rate(%)']}%)")
+        print(
+            f"    Vector 정답: {summary['vector_success_count']}/{summary['total_questions']} "
+            f"({summary['vector_success_rate(%)']}%) "
+            f"[오답 {summary.get('vector_incorrect_count', 0)}, "
+            f"스킵 {summary.get('vector_skipped_count', 0)}, "
+            f"에러 {summary.get('vector_error_count', 0)}]"
+        )
+        print(
+            f"    Hybrid 정답: {summary['hybrid_success_count']}/{summary['total_questions']} "
+            f"({summary['hybrid_success_rate(%)']}%) "
+            f"[오답 {summary.get('hybrid_incorrect_count', 0)}, "
+            f"스킵 {summary.get('hybrid_skipped_count', 0)}, "
+            f"에러 {summary.get('hybrid_error_count', 0)}]"
+        )
         print(f"    평균 Graph : {summary['avg_graph_count']}개 | 소요 : {exp_elapsed}초")
 
     total_elapsed = round(time.time() - total_start, 2)
