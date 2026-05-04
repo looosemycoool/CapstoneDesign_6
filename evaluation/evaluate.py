@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import traceback
@@ -79,12 +80,14 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
     # 수식으로 자동 집계 (결과 시트 참조)
     result_sheet = "② 결과"
+    # 새 컬럼 인덱스 (1-based):
+    #   E=Vector 정답, I=Hybrid 정답, L=Graph 수
     metrics = [
-        ("Vector 성공 수",    f"=COUNTIF('② 결과'!E2:E{n+1},\"성공\")"),
-        ("Vector 성공률",     f"=COUNTIF('② 결과'!E2:E{n+1},\"성공\")/COUNTA('② 결과'!E2:E{n+1})"),
-        ("Hybrid 성공 수",    f"=COUNTIF('② 결과'!H2:H{n+1},\"성공\")"),
-        ("Hybrid 성공률",     f"=COUNTIF('② 결과'!H2:H{n+1},\"성공\")/COUNTA('② 결과'!H2:H{n+1})"),
-        ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!J2:J{n+1})"),
+        ("Vector 정답 수",    f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")"),
+        ("Vector 정답률",     f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")/COUNTA('② 결과'!E2:E{n+1})"),
+        ("Hybrid 정답 수",    f"=COUNTIF('② 결과'!I2:I{n+1},\"정답\")"),
+        ("Hybrid 정답률",     f"=COUNTIF('② 결과'!I2:I{n+1},\"정답\")/COUNTA('② 결과'!I2:I{n+1})"),
+        ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!L2:L{n+1})"),
     ]
     for i, (label, formula) in enumerate(metrics, start=9):
         lc = ws1.cell(row=i, column=1, value=label)
@@ -155,11 +158,12 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
     headers = [
         "번호", "분류", "질문", "정답",
-        "Vector 성공", "Vector 답변", "Vector 오류",
-        "Hybrid 성공", "Hybrid 답변", "Graph 수", "Hybrid 오류",
+        "Vector 정답", "Vector 답변", "Vector 사유", "Vector 오류",
+        "Hybrid 정답", "Hybrid 답변", "Hybrid 사유", "Graph 수", "Hybrid 오류",
     ]
-    col_widths = [6, 10, 42, 32, 10, 42, 20, 10, 42, 8, 20]
-    SUCCESS_COLS = {5, 8}   # Vector 성공, Hybrid 성공 (1-based)
+    col_widths = [6, 10, 42, 32, 10, 42, 30, 20, 10, 42, 30, 8, 20]
+    SUCCESS_COLS = {5, 9}   # Vector 정답, Hybrid 정답 (1-based)
+    GRAPH_COL = 12           # Graph 수 컬럼 인덱스
 
     # 헤더
     for col_idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
@@ -172,11 +176,9 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
     # 데이터
     for idx, r in enumerate(rows, start=2):
-        # boolean → 문자열 변환
-        v_ok = r.get("vector_success")
-        h_ok = r.get("hybrid_success")
-        v_str = "성공" if v_ok is True or v_ok == "성공" else "실패"
-        h_str = "성공" if h_ok is True or h_ok == "성공" else "실패"
+        # vector_success/hybrid_success 는 이제 "정답 여부" (judge LLM 결과 또는 fallback)
+        v_str = "정답" if r.get("vector_success") is True else "오답"
+        h_str = "정답" if r.get("hybrid_success") is True else "오답"
 
         data = [
             r.get("id", ""),
@@ -185,9 +187,11 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
             r.get("ground_truth", ""),
             v_str,
             r.get("vector_answer", ""),
+            r.get("vector_judge_reason", ""),
             r.get("vector_error", ""),
             h_str,
             r.get("hybrid_answer", ""),
+            r.get("hybrid_judge_reason", ""),
             r.get("hybrid_graph_count", 0),
             r.get("hybrid_error", ""),
         ]
@@ -197,12 +201,12 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
             cell.font = N_FONT
 
             if col_idx in SUCCESS_COLS:
-                cell.fill      = SUCCESS_FILL if val == "성공" else FAIL_FILL
+                cell.fill      = SUCCESS_FILL if val == "정답" else FAIL_FILL
                 cell.alignment = AL_TC
             elif col_idx == 3:  # 질문 열 배경
                 cell.fill      = Q_FILL
                 cell.alignment = AL_TL
-            elif col_idx == 10:  # Graph 수
+            elif col_idx == GRAPH_COL:  # Graph 수
                 cell.alignment = AL_TC
             else:
                 cell.alignment = AL_TL
@@ -371,8 +375,59 @@ def llm_judge(question, ground_truth, generated_answer):
         print(f"    [Judge 오류] {e}")
         return False
 
+# ── LLM-as-judge: 답변 정답 여부 채점 ─────────────────────
+def get_judge_llm():
+    """채점용 LLM (기본 Upstage solar-pro).
+    환경변수 EVAL_JUDGE_MODEL 로 모델 변경 가능 (예: solar-mini).
+    """
+    from langchain_upstage import ChatUpstage
+    model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
+    return ChatUpstage(model=model, temperature=0)
+
+
+def judge_answer(question, ground_truth, predicted, judge_llm):
+    """LLM 으로 답변이 ground_truth 와 의미상 일치하는지 판단.
+    반환: (verdict, reason). verdict ∈ {"correct", "incorrect", "skipped", "error"}.
+    """
+    if not predicted or not str(predicted).strip():
+        return "incorrect", "답변 없음"
+    if not ground_truth or not str(ground_truth).strip():
+        return "skipped", "정답(ground_truth) 미제공"
+
+    prompt = (
+        "아래 RAG 챗봇 답변이 정답과 의미상 일치하는지 판단하세요.\n"
+        "사소한 표현 차이는 일치로 보고, 핵심 사실(날짜/금액/조건/대상/링크 등)이 "
+        "다르거나 누락되면 불일치로 판단하세요.\n\n"
+        f"질문: {question}\n"
+        f"정답: {ground_truth}\n"
+        f"답변: {predicted}\n\n"
+        "다음 JSON 한 줄로만 답하세요:\n"
+        '{"verdict": "correct" 또는 "incorrect", "reason": "한 문장"}'
+    )
+    try:
+        raw = judge_llm.invoke(prompt).content.strip()
+        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                v = str(obj.get("verdict", "")).strip().lower()
+                rsn = str(obj.get("reason", "")).strip()
+                if v in ("correct", "incorrect"):
+                    return v, rsn
+            except json.JSONDecodeError:
+                pass
+        low = raw.lower()
+        if "incorrect" in low:
+            return "incorrect", raw[:200]
+        if "correct" in low:
+            return "correct", raw[:200]
+        return "error", f"파싱 실패: {raw[:200]}"
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+
+
 # ── 질문 1개 평가 ────────────────────────────────────────
-def evaluate_one(module, item, index):
+def evaluate_one(module, item, index, judge_llm=None):
     qid = extract_id(item, index)
     category = extract_category(item)
     question = extract_question(item)
@@ -384,7 +439,10 @@ def evaluate_one(module, item, index):
         "question": question,
         "ground_truth": ground_truth,
 
+        # vector_success: True 면 정답으로 판정 (judge_llm 미설정 시 실행 성공만 의미)
         "vector_success": False,
+        "vector_judge_verdict": "skipped",
+        "vector_judge_reason": "",
         "vector_answer": "",
         "vector_sources": "",
         "vector_scored_sources": "",
@@ -392,6 +450,8 @@ def evaluate_one(module, item, index):
         "vector_error": "",
 
         "hybrid_success": False,
+        "hybrid_judge_verdict": "skipped",
+        "hybrid_judge_reason": "",
         "hybrid_answer": "",
         "hybrid_sources": "",
         "hybrid_scored_sources": "",
@@ -406,7 +466,8 @@ def evaluate_one(module, item, index):
         row["hybrid_error"] = "질문 없음"
         return row
 
-    # Vector Only
+    # Vector Only — 실행
+    vector_answer = ""
     try:
         vector_result = module.vector_only_rag(question, verbose=False)
         vector_docs = vector_result.get("vector_docs", [])
@@ -414,14 +475,28 @@ def evaluate_one(module, item, index):
 
         vector_answer = vector_result.get("answer", "")
         row["vector_answer"] = vector_answer
-        row["vector_success"] = llm_judge(question, ground_truth, vector_answer)
         row["vector_sources"] = vector_summary["sources"]
         row["vector_scored_sources"] = vector_summary["scored_sources"]
         row["vector_context_preview"] = truncate_text(vector_result.get("context", ""))
     except Exception as e:
         row["vector_error"] = f"{type(e).__name__}: {e}"
 
-    # Hybrid
+    # Vector — 채점
+    if row["vector_error"]:
+        row["vector_judge_verdict"] = "error"
+        row["vector_judge_reason"] = "파이프라인 오류"
+    elif judge_llm is not None:
+        verdict, reason = judge_answer(question, ground_truth, vector_answer, judge_llm)
+        row["vector_judge_verdict"] = verdict
+        row["vector_judge_reason"] = reason
+        row["vector_success"] = (verdict == "correct")
+    else:
+        # judge LLM 미설정: 이전 동작 유지 (실행 성공 = success)
+        row["vector_success"] = True
+        row["vector_judge_reason"] = "judge 미설정"
+
+    # Hybrid — 실행
+    hybrid_answer = ""
     try:
         hybrid_result = module.hybrid_rag(question, verbose=False)
         hybrid_docs = hybrid_result.get("vector_docs", [])
@@ -439,6 +514,19 @@ def evaluate_one(module, item, index):
     except Exception as e:
         row["hybrid_error"] = f"{type(e).__name__}: {e}"
 
+    # Hybrid — 채점
+    if row["hybrid_error"]:
+        row["hybrid_judge_verdict"] = "error"
+        row["hybrid_judge_reason"] = "파이프라인 오류"
+    elif judge_llm is not None:
+        verdict, reason = judge_answer(question, ground_truth, hybrid_answer, judge_llm)
+        row["hybrid_judge_verdict"] = verdict
+        row["hybrid_judge_reason"] = reason
+        row["hybrid_success"] = (verdict == "correct")
+    else:
+        row["hybrid_success"] = True
+        row["hybrid_judge_reason"] = "judge 미설정"
+
     return row
 
 
@@ -454,6 +542,16 @@ def run_evaluation():
     collection_name = getattr(module, "COLLECTION_NAME", "")
     experiment_id = getattr(module, "EXPERIMENT_ID", "")
 
+    # LLM-as-judge: 답변이 ground_truth 와 일치하는지 채점
+    try:
+        judge_llm = get_judge_llm()
+        judge_model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
+        print(f" - Judge LLM: {judge_model} (Upstage)")
+    except Exception as e:
+        judge_llm = None
+        print(f" - Judge LLM 사용 불가 ({type(e).__name__}: {e})")
+        print(f"   → 정답 비교 없이 진행. 'success'는 실행 성공만 의미.")
+
     print(f" - 벡터 컬렉션: {collection_name}")
     print(f" - 실험 ID: {experiment_id}")
     print(f" - 총 질문 수: {len(dataset)}개")
@@ -465,7 +563,7 @@ def run_evaluation():
         question = extract_question(item)
         print(f"\n[{idx + 1}/{len(dataset)}] {question[:80]}")
         try:
-            row = evaluate_one(module, item, idx)
+            row = evaluate_one(module, item, idx, judge_llm)
         except Exception as e:
             row = {
                 "id": extract_id(item, idx),
@@ -474,6 +572,8 @@ def run_evaluation():
                 "ground_truth": extract_ground_truth(item),
 
                 "vector_success": False,
+                "vector_judge_verdict": "error",
+                "vector_judge_reason": "평가 핸들러 오류",
                 "vector_answer": "",
                 "vector_sources": "",
                 "vector_scored_sources": "",
@@ -481,6 +581,8 @@ def run_evaluation():
                 "vector_error": f"Unhandled: {type(e).__name__}: {e}",
 
                 "hybrid_success": False,
+                "hybrid_judge_verdict": "error",
+                "hybrid_judge_reason": "평가 핸들러 오류",
                 "hybrid_answer": "",
                 "hybrid_sources": "",
                 "hybrid_scored_sources": "",
@@ -490,9 +592,11 @@ def run_evaluation():
                 "hybrid_error": f"Unhandled: {type(e).__name__}: {e}",
             }
 
+        v_label = "정답" if row["vector_success"] else f"오답({row.get('vector_judge_verdict', '?')})"
+        h_label = "정답" if row["hybrid_success"] else f"오답({row.get('hybrid_judge_verdict', '?')})"
         print(
-            f"  - Vector: {'성공' if row['vector_success'] else '실패'}"
-            f" | Hybrid: {'성공' if row['hybrid_success'] else '실패'}"
+            f"  - Vector: {v_label}"
+            f" | Hybrid: {h_label}"
             f" | Graph relations: {row['hybrid_graph_count']}"
         )
         rows.append(row)
@@ -528,11 +632,23 @@ def run_evaluation():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
+    def _count_verdict(field, target):
+        if df.empty or field not in df.columns:
+            return 0
+        return int((df[field] == target).sum())
+
     summary = {
         "timestamp": timestamp,
         "total_questions": len(rows),
-        "vector_success_count": int(df["vector_success"].sum()) if not df.empty else 0,
-        "hybrid_success_count": int(df["hybrid_success"].sum()) if not df.empty else 0,
+        "judge_used": judge_llm is not None,
+        "vector_correct_count": int(df["vector_success"].sum()) if not df.empty else 0,
+        "vector_incorrect_count": _count_verdict("vector_judge_verdict", "incorrect"),
+        "vector_skipped_count": _count_verdict("vector_judge_verdict", "skipped"),
+        "vector_error_count": _count_verdict("vector_judge_verdict", "error"),
+        "hybrid_correct_count": int(df["hybrid_success"].sum()) if not df.empty else 0,
+        "hybrid_incorrect_count": _count_verdict("hybrid_judge_verdict", "incorrect"),
+        "hybrid_skipped_count": _count_verdict("hybrid_judge_verdict", "skipped"),
+        "hybrid_error_count": _count_verdict("hybrid_judge_verdict", "error"),
         "avg_hybrid_graph_count": round(df["hybrid_graph_count"].mean(), 2) if not df.empty else 0,
         "collection_name": collection_name,
         "experiment_id": experiment_id,
@@ -546,9 +662,23 @@ def run_evaluation():
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print("\n[완료] 평가 종료")
+    n = summary["total_questions"] or 1
     print(f" - 총 질문 수: {summary['total_questions']}")
-    print(f" - Vector 성공: {summary['vector_success_count']}")
-    print(f" - Hybrid 성공: {summary['hybrid_success_count']}")
+    if summary["judge_used"]:
+        print(
+            f" - Vector 정답: {summary['vector_correct_count']}/{n} "
+            f"(오답 {summary['vector_incorrect_count']}, "
+            f"스킵 {summary['vector_skipped_count']}, 에러 {summary['vector_error_count']})"
+        )
+        print(
+            f" - Hybrid 정답: {summary['hybrid_correct_count']}/{n} "
+            f"(오답 {summary['hybrid_incorrect_count']}, "
+            f"스킵 {summary['hybrid_skipped_count']}, 에러 {summary['hybrid_error_count']})"
+        )
+    else:
+        print(f" - Vector 실행 성공: {summary['vector_correct_count']}")
+        print(f" - Hybrid 실행 성공: {summary['hybrid_correct_count']}")
+        print(f" - (judge LLM 미사용 — 정답 비교 없음)")
     print(f" - 평균 Graph 관계 수: {summary['avg_hybrid_graph_count']}")
     print(f" - 소요 시간: {summary['elapsed_seconds']}초")
     print(f" - 결과 xlsx: {xlsx_path}")
