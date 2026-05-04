@@ -325,8 +325,14 @@ def truncate_text(text, limit=1500):
     return text[:limit] + "...[truncated]"
 
 def llm_judge(question, ground_truth, generated_answer):
-    if not generated_answer or not ground_truth:
-        return False
+    if not generated_answer:
+        raise ValueError("generated_answer가 비어 있습니다.")
+    if not ground_truth:
+        raise ValueError("ground_truth가 비어 있습니다.")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY가 환경변수에 없습니다.")
 
     prompt = f"""당신은 대학교 학사 공지사항 챗봇의 신뢰성을 검증하는 엄격한 AI 심사위원입니다.
             아래 [질문]에 대한 [실제 정답]과 [챗봇이 생성한 답변]을 비교하여 정확성을 평가하세요.
