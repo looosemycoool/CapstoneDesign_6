@@ -28,8 +28,36 @@ import sys
 import json
 import time
 import traceback
+import subprocess
 import importlib.util
 from datetime import datetime
+
+
+def _get_git_hash() -> str:
+    """현재 commit 의 짧은 hash (재현성 위해 xlsx 메타데이터에 기록)."""
+    try:
+        h = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+        return h or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _get_eval_metadata() -> dict:
+    """평가 재현성을 위한 모델/하이퍼파라미터/git hash 메타데이터.
+    값이 바뀌면 여기 직접 갱신 (런타임 동적 import 보다 단순/명시적이 낫다)."""
+    return {
+        "Generation 모델":  "solar-pro-3",
+        "Generation temp":  "0.2",
+        "Judge 모델":       f"{os.getenv('EVAL_JUDGE_MODEL', 'solar-pro-2')} (temp=0)",
+        "Embedding 모델":   "embedding-passage",
+        "chunk_size":       "500 (실측)",
+        "max_relations":    "5",
+        "n_results":        "3",
+        "git hash":         _get_git_hash(),
+    }
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -758,6 +786,13 @@ def _save_xlsx(all_rows, experiment_summaries, xlsx_path):
             s["avg_graph_count"],
             round(s["elapsed_seconds"] / 60, 1),
         ])
+
+    # 빈 줄 + 메타데이터 (재현성: 모델/하이퍼파라미터/git hash)
+    ws.append([])
+    ws.append(["📋 실행 메타데이터"])
+    for label, val in _get_eval_metadata().items():
+        ws.append([label, val])
+
     _fmt_sheet(ws, C["h_green"], F, AL_C, AL_TL,
                col_widths=[14, 32, 18, 14, 14, 14, 10],
                freeze="A2", success_col=None)

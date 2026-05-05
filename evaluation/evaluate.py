@@ -31,6 +31,7 @@ def _get_eval_metadata() -> dict:
         "Generation temp":  "0.2",
         "Judge 모델":       f"{os.getenv('EVAL_JUDGE_MODEL', 'solar-pro-2')} (temp=0)",
         "Embedding 모델":   "embedding-passage",
+        "chunk_size":       "500 (실측)",
         "max_relations":    "5",
         "n_results":        "3",
         "git hash":         _get_git_hash(),
