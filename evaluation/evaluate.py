@@ -3,11 +3,39 @@ import re
 import json
 import time
 import traceback
+import subprocess
 import importlib.util
 from datetime import datetime
 
 import pandas as pd
 import openpyxl
+
+
+def _get_git_hash() -> str:
+    """현재 commit 의 짧은 hash (재현성 위해 xlsx 메타데이터에 기록)."""
+    try:
+        h = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+        return h or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _get_eval_metadata() -> dict:
+    """평가 재현성을 위한 모델/하이퍼파라미터/git hash 메타데이터.
+    값이 바뀌면 여기 직접 갱신 (런타임 동적 import 보다 단순/명시적이 낫다)."""
+    return {
+        "Generation 모델":  "solar-pro-3",
+        "Generation temp":  "0.2",
+        "Judge 모델":       f"{os.getenv('EVAL_JUDGE_MODEL', 'solar-pro-2')} (temp=0)",
+        "Embedding 모델":   "embedding-passage",
+        "chunk_size":       "500 (실측)",
+        "max_relations":    "5",
+        "n_results":        "3",
+        "git hash":         _get_git_hash(),
+    }
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -67,21 +95,25 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
         ("평가 일시",     timestamp),
         ("소요 시간(초)", elapsed),
     ]
+    # 재현성용 메타데이터 (모델/하이퍼파라미터/git hash) 추가
+    info.extend(_get_eval_metadata().items())
+
     for i, (label, val) in enumerate(info, start=2):
         label_row(ws1, i, label, val)
 
-    # 구분선
-    ws1.merge_cells("A8:B8")
-    ws1["A8"].value = "📈 성능 지표"
-    ws1["A8"].font = H_FONT
-    ws1["A8"].fill = BLUE_FILL
-    ws1["A8"].alignment = AL_C
-    ws1.row_dimensions[8].height = 22
+    # 동적 행 계산: title=1, info=2..(1+len), 빈 줄, 성능 지표 헤더, metrics
+    metrics_header_row = 2 + len(info) + 1  # info 끝 다음 행
+    metrics_start_row = metrics_header_row + 1
 
-    # 수식으로 자동 집계 (결과 시트 참조)
-    result_sheet = "② 결과"
-    # 새 컬럼 인덱스 (1-based):
-    #   E=Vector 정답, I=Hybrid 정답, L=Graph 수
+    ws1.merge_cells(start_row=metrics_header_row, start_column=1,
+                    end_row=metrics_header_row, end_column=2)
+    ws1.cell(row=metrics_header_row, column=1, value="📈 성능 지표")
+    ws1.cell(row=metrics_header_row, column=1).font = H_FONT
+    ws1.cell(row=metrics_header_row, column=1).fill = BLUE_FILL
+    ws1.cell(row=metrics_header_row, column=1).alignment = AL_C
+    ws1.row_dimensions[metrics_header_row].height = 22
+
+    # 새 컬럼 인덱스 (1-based): E=Vector 정답, I=Hybrid 정답, L=Graph 수
     metrics = [
         ("Vector 정답 수",    f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")"),
         ("Vector 정답률",     f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")/COUNTA('② 결과'!E2:E{n+1})"),
@@ -89,22 +121,22 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
         ("Hybrid 정답률",     f"=COUNTIF('② 결과'!I2:I{n+1},\"정답\")/COUNTA('② 결과'!I2:I{n+1})"),
         ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!L2:L{n+1})"),
     ]
-    for i, (label, formula) in enumerate(metrics, start=9):
+    for i, (label, formula) in enumerate(metrics, start=metrics_start_row):
         lc = ws1.cell(row=i, column=1, value=label)
         vc = ws1.cell(row=i, column=2, value=formula)
         lc.font = B_FONT
         lc.alignment = AL_C
         vc.font = N_FONT
         vc.alignment = AL_TC
-        # 성공률 셀은 퍼센트 형식
-        if "성공률" in label:
+        if "정답률" in label:
             vc.number_format = "0.0%"
         elif "평균" in label:
             vc.number_format = "0.00"
 
     # 테두리
     thin = Side(style="thin", color="CCCCCC")
-    for row in ws1.iter_rows(min_row=1, max_row=13, min_col=1, max_col=2):
+    last_row = metrics_start_row + len(metrics)
+    for row in ws1.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=2):
         for cell in row:
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -288,13 +320,19 @@ def truncate_text(text, limit=1500):
 
 
 # ── LLM-as-judge: 답변 정답 여부 채점 ─────────────────────
+JUDGE_MODEL = "solar-pro-2"  # 재현성을 위해 generation 과 다른 dated 모델 고정
+JUDGE_TEMPERATURE = 0
+JUDGE_BASE_URL = "https://api.upstage.ai/v1"
+
+
 def get_judge_llm():
-    """채점용 LLM (기본 Upstage solar-pro).
-    환경변수 EVAL_JUDGE_MODEL 로 모델 변경 가능 (예: solar-mini).
-    """
-    from langchain_upstage import ChatUpstage
-    model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
-    return ChatUpstage(model=model, temperature=0)
+    """채점용 클라이언트 (Upstage solar-pro-2, OpenAI SDK 호환 endpoint).
+    환경변수 EVAL_JUDGE_MODEL 로 모델 변경 가능."""
+    from openai import OpenAI
+    api_key = os.getenv("UPSTAGE_API_KEY")
+    if not api_key:
+        raise RuntimeError("UPSTAGE_API_KEY 가 .env 에 없음 — judge 사용 불가")
+    return OpenAI(api_key=api_key, base_url=JUDGE_BASE_URL)
 
 
 def judge_answer(question, ground_truth, predicted, judge_llm):
@@ -317,7 +355,13 @@ def judge_answer(question, ground_truth, predicted, judge_llm):
         '{"verdict": "correct" 또는 "incorrect", "reason": "한 문장"}'
     )
     try:
-        raw = judge_llm.invoke(prompt).content.strip()
+        model_name = os.getenv("EVAL_JUDGE_MODEL", JUDGE_MODEL)
+        response = judge_llm.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=JUDGE_TEMPERATURE,
+        )
+        raw = response.choices[0].message.content.strip()
         m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
         if m:
             try:
@@ -456,8 +500,8 @@ def run_evaluation():
     # LLM-as-judge: 답변이 ground_truth 와 일치하는지 채점
     try:
         judge_llm = get_judge_llm()
-        judge_model = os.getenv("EVAL_JUDGE_MODEL", "solar-pro")
-        print(f" - Judge LLM: {judge_model} (Upstage)")
+        judge_model = os.getenv("EVAL_JUDGE_MODEL", JUDGE_MODEL)
+        print(f" - Judge LLM: {judge_model} (Upstage, temp={JUDGE_TEMPERATURE})")
     except Exception as e:
         judge_llm = None
         print(f" - Judge LLM 사용 불가 ({type(e).__name__}: {e})")

@@ -17,7 +17,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v1")
-EXTRACT_MODEL = "solar-pro"   # 개체·관계 추출 및 노드 통합에 사용
+EXTRACT_MODEL = "solar-pro-3"   # 개체·관계 추출 및 노드 통합에 사용
 
 
 def get_driver():

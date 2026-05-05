@@ -28,7 +28,7 @@ upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.a
 
 def get_embedding_function():
     return UpstageEmbeddings(
-        model="solar-embedding-1-large-passage",
+        model="embedding-passage",  # 현행 표기 (이전 solar-embedding-1-large-passage 동일)
         api_key=UPSTAGE_API_KEY,
     )
 
@@ -267,8 +267,13 @@ def merge_results(vector_docs, graph_relations):
 
 
 # ── LLM 답변 생성 ─────────────────────────────────────────
-def generate_answer(query, context, model="solar-pro"):
-    """컨텍스트 기반 LLM 답변 생성"""
+GENERATION_MODEL = "solar-pro-3"  # 단일 source of truth — 호출부에서 이 상수 참조
+GENERATION_TEMPERATURE = 0.2     # 논문 기록용 (낮은 값으로 결정성/재현성 우선)
+GENERATION_MAX_TOKENS = None     # None=모델 기본값 (solar-pro-3 ~ 4k), 정수면 cap
+
+
+def generate_answer(query, context, model=GENERATION_MODEL):
+    """컨텍스트 기반 LLM 답변 생성. 모델/온도/max_tokens 는 모듈 상수 참조."""
     if not context.strip():
         return "해당 정보를 찾을 수 없습니다."
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
@@ -289,11 +294,18 @@ def generate_answer(query, context, model="solar-pro"):
 [답변]
 """
 
-    response = upstage_client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
+    api_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": GENERATION_TEMPERATURE,
+    }
+    # 상수가 None 이 아니면 실제로 cap 적용 (None 일 땐 모델 기본값).
+    # CodeRabbit 지적: 상수만 정의하고 호출부에서 사용 안 하면 paper 와 코드가
+    # 어긋나 재현성이 깨진다.
+    if GENERATION_MAX_TOKENS is not None:
+        api_kwargs["max_tokens"] = GENERATION_MAX_TOKENS
+
+    response = upstage_client.chat.completions.create(**api_kwargs)
 
     return response.choices[0].message.content.strip()
 
@@ -334,7 +346,7 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
             graph_relations = []
 
     context = merge_results(vector_docs, graph_relations)
-    answer = generate_answer(query, context, model = "solar-pro")
+    answer = generate_answer(query, context, model=GENERATION_MODEL)
 
     if verbose:
         print(f"\n[최종 답변]\n{answer}")
@@ -357,7 +369,7 @@ def vector_only_rag(query, verbose=True):
 
     vector_docs = vector_search(query, n_results=3)
     context = merge_results(vector_docs, [])
-    answer = generate_answer(query, context, model = "solar-pro")
+    answer = generate_answer(query, context, model=GENERATION_MODEL)
 
     if verbose:
         print(f"\n[Vector Only 답변]\n{answer}")
