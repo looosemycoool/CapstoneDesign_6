@@ -123,9 +123,8 @@ def extract_keywords(query):
 
 # ── Graph 검색 ───────────────────────────────────────────
 def _score_relation(rel, keywords):
-    """질문 키워드와의 매칭 점수. 정확 일치 가중치 부여.
-    낮은 점수의 무관한 관계가 LLM context 의 절반을 차지해 답변 품질을
-    저하시키던 문제를 해결하기 위한 필터링용."""
+    """질문 키워드와의 매칭 점수. 정확 일치 + 1-hop 우선.
+    2-hop (간접) 관계는 hop=2 마커로 점수 페널티 적용."""
     score = 0
     from_node = rel.get("from", "")
     to_node = rel.get("to", "")
@@ -141,14 +140,19 @@ def _score_relation(rel, keywords):
             score += 3
         elif kw in to_node:
             score += 1
+    # 2-hop 은 1-hop 의 절반 가중치 (간접 관계라 신뢰도 낮음)
+    if rel.get("hop", 1) == 2:
+        score = score / 2.0
     return score
 
 
-def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
-    """Neo4j에서 키워드 기반 관계 탐색.
-    이전엔 max_relations=20 으로 너무 많은 무관한 관계까지 LLM 에 넘겨 hybrid
-    답변 품질이 vector 단독보다 떨어지던 문제가 있었다.
-    이제 키워드 매칭 점수 상위 5개만 반환."""
+def graph_search(query, max_nodes_per_keyword=10, max_relations=5):
+    """Neo4j 에서 키워드 기반 관계 탐색.
+    1-hop 직접 관계 + 2-hop 간접 관계까지 수집한 후, 키워드 매칭 점수
+    상위 max_relations 만 LLM context 에 전달.
+    - max_nodes_per_keyword 5 → 10: 후보 노드 확대 (recall ↑)
+    - 2-hop: paper 의 '깊이 2' 약속 실현. 점수에서 1/2 페널티로 노이즈 통제
+    """
     driver = get_neo4j_driver()
     results = []
     seen = set()
@@ -178,7 +182,7 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
                 if not node_id or not node_name:
                     continue
 
-                # 정방향 관계
+                # 1-hop 정방향
                 rel_result = session.run("""
                     MATCH (a)-[r]->(b)
                     WHERE elementId(a) = $node_id
@@ -188,25 +192,18 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
                 """, {"node_id": node_id})
-
                 for row in rel_result.data():
                     from_node = (row.get("from_node") or "").strip()
                     rel = (row.get("rel") or "").strip()
                     to_node = (row.get("to_node") or "").strip()
-
                     if not from_node or not to_node:
                         continue
-
-                    key = (from_node, rel, to_node)
+                    key = (from_node, rel, to_node, 1)
                     if key not in seen:
-                        results.append({
-                            "from": from_node,
-                            "relation": rel,
-                            "to": to_node
-                        })
+                        results.append({"from": from_node, "relation": rel, "to": to_node, "hop": 1})
                         seen.add(key)
 
-                # 역방향 관계
+                # 1-hop 역방향
                 rev_result = session.run("""
                     MATCH (a)-[r]->(b)
                     WHERE elementId(b) = $node_id
@@ -216,27 +213,47 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
                         coalesce(b.name, b.title, b.file_name, '') AS to_node
                     LIMIT 10
                 """, {"node_id": node_id})
-
                 for row in rev_result.data():
                     from_node = (row.get("from_node") or "").strip()
                     rel = (row.get("rel") or "").strip()
                     to_node = (row.get("to_node") or "").strip()
-
                     if not from_node or not to_node:
                         continue
-
-                    key = (from_node, rel, to_node)
+                    key = (from_node, rel, to_node, 1)
                     if key not in seen:
-                        results.append({
-                            "from": from_node,
-                            "relation": rel,
-                            "to": to_node
-                        })
+                        results.append({"from": from_node, "relation": rel, "to": to_node, "hop": 1})
+                        seen.add(key)
+
+                # 2-hop (간접 경로). 마지막 edge 만 결과로 추가해서 1-hop 과 dedup.
+                hop2_result = session.run("""
+                    MATCH (a)-[*2..2]-(b)
+                    WHERE elementId(a) = $node_id AND elementId(b) <> $node_id
+                    WITH DISTINCT a, b
+                    MATCH (b)-[r]-(c)
+                    WHERE c <> a AND elementId(c) <> $node_id
+                    RETURN DISTINCT
+                        coalesce(b.name, b.title, b.file_name, '') AS from_node,
+                        type(r) AS rel,
+                        coalesce(c.name, c.title, c.file_name, '') AS to_node
+                    LIMIT 10
+                """, {"node_id": node_id})
+                for row in hop2_result.data():
+                    from_node = (row.get("from_node") or "").strip()
+                    rel = (row.get("rel") or "").strip()
+                    to_node = (row.get("to_node") or "").strip()
+                    if not from_node or not to_node:
+                        continue
+                    # 1-hop 으로 이미 포함됐으면 hop=2 추가 안 함
+                    if (from_node, rel, to_node, 1) in seen:
+                        continue
+                    key = (from_node, rel, to_node, 2)
+                    if key not in seen:
+                        results.append({"from": from_node, "relation": rel, "to": to_node, "hop": 2})
                         seen.add(key)
 
     driver.close()
 
-    # 키워드 매칭 점수가 0 인 관계는 노이즈로 보고 제거, 그 외는 점수순 정렬.
+    # 점수 0 (무관) 제거, 점수순 정렬, top-k. 2-hop 은 _score_relation 에서 절반 페널티.
     scored = [(r, _score_relation(r, keywords)) for r in results]
     scored = [(r, s) for r, s in scored if s > 0]
     scored.sort(key=lambda x: -x[1])
@@ -259,7 +276,9 @@ def merge_results(vector_docs, graph_relations):
         graph_text = "=== 관계 그래프 검색 결과 ===\n"
         for rel in graph_relations:
             if rel["from"] and rel["to"]:
-                graph_text += f"- {rel['from']} --[{rel['relation']}]--> {rel['to']}\n"
+                # hop=2 (간접) 는 LLM 이 더 신중하게 다루도록 표기
+                marker = "" if rel.get("hop", 1) == 1 else " (간접)"
+                graph_text += f"- {rel['from']} --[{rel['relation']}]--> {rel['to']}{marker}\n"
         context_parts.append(graph_text.strip())
 
     return "\n\n".join(context_parts).strip()
