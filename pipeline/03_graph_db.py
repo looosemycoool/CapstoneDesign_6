@@ -49,9 +49,13 @@ _NULL_LIKE_NAMES = {"none", "null", "n/a", "nan", "undefined", "unknown", ""}
 
 
 def normalize_node_name(text) -> str:
-    """노드 이름 정규화. None/null 류 입력은 'Unknown' 으로 거부 (str(None)='None' 같은
-    sentinel 값이 그대로 노드 이름이 되어 graph 가 오염되는 것을 방지)."""
+    """노드 이름 정규화. None/null/비정형 입력은 'Unknown' 으로 거부.
+    dict/list 가 들어오면 str(dict) 결과가 그대로 노드 이름이 되는 것을 방지."""
     if text is None:
+        return "Unknown"
+
+    # str/숫자만 허용. LLM 이 dict/list 를 name 필드에 섞어 반환하는 케이스 방어.
+    if not isinstance(text, (str, int, float)):
         return "Unknown"
 
     text = str(text).strip()
