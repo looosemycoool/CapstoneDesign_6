@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import traceback
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from openai import OpenAI
@@ -44,11 +45,23 @@ ALIAS_MAP = {
 PLACEHOLDER_NAMES = {"홍길동"}
 
 
-def normalize_node_name(text: str) -> str:
-    if not text:
+_NULL_LIKE_NAMES = {"none", "null", "n/a", "nan", "undefined", "unknown", ""}
+
+
+def normalize_node_name(text) -> str:
+    """노드 이름 정규화. None/null/비정형 입력은 'Unknown' 으로 거부.
+    dict/list 가 들어오면 str(dict) 결과가 그대로 노드 이름이 되는 것을 방지."""
+    if text is None:
+        return "Unknown"
+
+    # str/숫자만 허용. LLM 이 dict/list 를 name 필드에 섞어 반환하는 케이스 방어.
+    if not isinstance(text, (str, int, float)):
         return "Unknown"
 
     text = str(text).strip()
+    if text.lower() in _NULL_LIKE_NAMES:
+        return "Unknown"
+
     text = re.sub(r"\s+", " ", text)
 
     if text in ALIAS_MAP:
@@ -217,7 +230,12 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
         entity_names = set()
 
         for ent in entities:
-            name = normalize_node_name(str(ent.get("name", "")))
+            # LLM 이 가끔 dict 가 아닌 string/list 같은 잘못된 형식을 섞어 반환함.
+            # isinstance 체크 없이 바로 .get() 호출하면 한 개 망가진 항목 때문에
+            # 그 문서의 entity/relation 추출 결과 전체가 폐기됨.
+            if not isinstance(ent, dict):
+                continue
+            name = normalize_node_name(ent.get("name"))
             if not name or name == "Unknown" or should_skip_entity_name(name):
                 continue
 
@@ -228,8 +246,10 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
         filtered_relations = []
 
         for rel in relations:
-            from_name = normalize_node_name(str(rel.get("from", "")))
-            to_name = normalize_node_name(str(rel.get("to", "")))
+            if not isinstance(rel, dict):
+                continue
+            from_name = normalize_node_name(rel.get("from"))
+            to_name = normalize_node_name(rel.get("to"))
 
             if should_skip_entity_name(from_name) or should_skip_entity_name(to_name):
                 continue
@@ -245,7 +265,10 @@ def extract_entities_and_relations(file_name: str, text: str) -> dict:
         }
 
     except Exception as e:
-        print(f"  [Upstage 오류] {e}")
+        # silently 빈 결과 반환하면 graph 품질 저하의 원인을 못 찾는다.
+        # 일단 디그레이드 동작은 유지하되, 진단 가능하도록 traceback 남김.
+        print(f"  [추출 오류] {file_name}: {type(e).__name__}: {e}")
+        print(traceback.format_exc())
         return {"entities": [], "relations": []}
 
 
