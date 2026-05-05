@@ -101,6 +101,7 @@ def extract_keywords(query):
 
     for token in cleaned.split():
         token = token.strip()
+        # 한글 2자 미만은 노이즈 (조사 잔재 등). 영숫자는 2자 허용.
         if len(token) < 2:
             continue
         if token in stopwords:
@@ -115,12 +116,40 @@ def extract_keywords(query):
             unique_tokens.append(token)
             seen.add(token)
 
+    # 긴 키워드(고유명사/복합어일 가능성)를 우선해서 graph 매칭 정밀도 향상.
+    # "스타트업" 같은 짧은 일반어보다 "K-스타트업 2025" 같은 specific 토큰을 먼저 사용.
+    unique_tokens.sort(key=lambda t: -len(t))
     return unique_tokens[:5]
 
 
 # ── Graph 검색 ───────────────────────────────────────────
-def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
-    """Neo4j에서 키워드 기반 관계 탐색"""
+def _score_relation(rel, keywords):
+    """질문 키워드와의 매칭 점수. 정확 일치 가중치 부여.
+    낮은 점수의 무관한 관계가 LLM context 의 절반을 차지해 답변 품질을
+    저하시키던 문제를 해결하기 위한 필터링용."""
+    score = 0
+    from_node = rel.get("from", "")
+    to_node = rel.get("to", "")
+    for kw in keywords:
+        if not kw:
+            continue
+        # 양쪽 노드 정확 일치 = 강한 단서
+        if kw == from_node:
+            score += 3
+        elif kw in from_node:
+            score += 1
+        if kw == to_node:
+            score += 3
+        elif kw in to_node:
+            score += 1
+    return score
+
+
+def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
+    """Neo4j에서 키워드 기반 관계 탐색.
+    이전엔 max_relations=20 으로 너무 많은 무관한 관계까지 LLM 에 넘겨 hybrid
+    답변 품질이 vector 단독보다 떨어지던 문제가 있었다.
+    이제 키워드 매칭 점수 상위 5개만 반환."""
     driver = get_neo4j_driver()
     results = []
     seen = set()
@@ -207,7 +236,12 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=20):
                         seen.add(key)
 
     driver.close()
-    return results[:max_relations]
+
+    # 키워드 매칭 점수가 0 인 관계는 노이즈로 보고 제거, 그 외는 점수순 정렬.
+    scored = [(r, _score_relation(r, keywords)) for r in results]
+    scored = [(r, s) for r, s in scored if s > 0]
+    scored.sort(key=lambda x: -x[1])
+    return [r for r, _ in scored[:max_relations]]
 
 
 # ── 결과 통합 ─────────────────────────────────────────────
@@ -238,7 +272,11 @@ def generate_answer(query, context, model="solar-pro"):
     if not context.strip():
         return "해당 정보를 찾을 수 없습니다."
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
-아래 검색된 문서 내용과 그래프 관계 정보를 바탕으로 질문에 답변하세요.
+
+아래 검색 결과를 바탕으로 질문에 답변하세요. 검색 결과는 두 가지로 구성됩니다:
+- [문서 검색 결과]: 공지/문서의 실제 본문. **답변의 주된 근거**로 사용하세요.
+- [관계 그래프 검색 결과]: 개체 간 관계 단서. 보조 정보로만 사용하고, 본문과 모순되거나 본문에 직접적인 답이 있으면 본문을 우선하세요.
+
 반드시 검색 결과에 근거해서만 답변하세요.
 검색 결과에 없는 내용은 추측하지 말고 "해당 정보를 찾을 수 없습니다."라고 답변하세요.
 
