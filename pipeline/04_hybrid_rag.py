@@ -27,8 +27,19 @@ upstage_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.a
 
 
 def get_embedding_function():
+    """문서 인덱싱용 (vector DB 빌드 시 사용)."""
     return UpstageEmbeddings(
         model="embedding-passage",  # 현행 표기 (이전 solar-embedding-1-large-passage 동일)
+        api_key=UPSTAGE_API_KEY,
+    )
+
+
+def get_query_embedding_function():
+    """쿼리 임베딩용 (vector_search 시 사용).
+    Upstage 는 인덱싱(passage) 과 쿼리(query) 에 별도 모델을 권장.
+    같은 임베딩 공간에 정렬돼 있어 retrieval 정밀도가 더 높음."""
+    return UpstageEmbeddings(
+        model="embedding-query",
         api_key=UPSTAGE_API_KEY,
     )
 
@@ -49,8 +60,9 @@ def get_neo4j_driver():
 
 # ── Vector 검색 ──────────────────────────────────────────
 def vector_search(query, n_results=3):
-    """Chroma에서 유사도 기반 검색"""
-    embedding_fn = get_embedding_function()
+    """Chroma 에서 유사도 기반 검색.
+    쿼리는 embedding-query, 인덱스는 embedding-passage (Upstage 권장 분리)."""
+    embedding_fn = get_query_embedding_function()
     client = get_chroma_client()
 
     # Chroma v0.6 부터 list_collections() 가 collection name 문자열만 반환.
