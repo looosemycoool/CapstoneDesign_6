@@ -31,7 +31,9 @@ CHROMA_DIR = os.path.join(BASE_DIR, "chroma_db")
 load_dotenv(ENV_PATH)
 
 # ── 청킹 / 임베딩 설정 (paper 기록용 단일 source of truth) ──
-CHUNK_SIZE = 250
+# chunk_size 250 ablation 결과 hybrid 정답률 -9 (52→43) 로 음의 효과 →
+# 베스트 결과(20260505_201739) 와 동등한 chunk_size=500 으로 복원.
+CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 EMBEDDING_MODEL = "embedding-passage"   # Upstage 현행 표기
 COLLECTION_NAME = "knu_cse_upstage_pro"  # 평가가 참조하는 컬렉션
@@ -82,6 +84,8 @@ def load_documents() -> list[dict]:
 def chunk_documents(docs: list[dict]) -> list[dict]:
     """RecursiveCharacterTextSplitter 로 청크 분할. metadata 보존.
     한국어 문서를 위해 separator 우선순위: 줄바꿈 → 마침표/쉼표 → 공백.
+    ID 는 doc_index 를 prefix 로 붙여 file_name 중복 시에도 unique 보장.
+    (서로 다른 공지에 같은 첨부 파일명이 있는 경우가 있음.)
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -91,16 +95,17 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
     )
 
     chunks = []
-    for doc in docs:
+    for doc_idx, doc in enumerate(docs):
         text = doc["parsed_text"]
         for i, chunk_text in enumerate(splitter.split_text(text)):
             chunks.append({
-                "id": f"{doc['file_name']}::chunk{i}",
+                "id": f"d{doc_idx:04d}::{doc['file_name']}::chunk{i}",
                 "text": chunk_text,
                 "metadata": {
                     "file_name": doc["file_name"],
                     "source_type": doc["source_type"],
                     "chunk_index": i,
+                    "doc_index": doc_idx,
                     **({"notice_title": doc["notice_title"]}
                        if "notice_title" in doc else {}),
                 },

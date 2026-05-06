@@ -205,7 +205,141 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
     ws2.freeze_panes = "E2"  # 질문까지 고정, 성공/실패부터 스크롤
 
+    # ── ③ 세부지표 시트 (논문 분석용 raw fields + 계산 metric) ──────────
+    _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
+                      BLUE_FILL, SUCCESS_FILL, FAIL_FILL, Q_FILL)
+
     wb.save(xlsx_path)
+
+
+def _xlsx_safe(val):
+    """openpyxl 이 거부하는 control character 제거.
+    raw context/answer 에 LLM 이 넣은 illegal char (예: \\x00) 를 sanitize."""
+    if not isinstance(val, str):
+        return val
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    return ILLEGAL_CHARACTERS_RE.sub("", val)
+
+
+def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
+                      BLUE_FILL, SUCCESS_FILL, FAIL_FILL, Q_FILL):
+    """논문 분석용 raw fields 가 모두 들어있는 세부지표 시트.
+    qa_dataset 에서 persona 도 join 해서 페르소나 단위 분석 가능.
+    """
+    # qa_dataset 으로 persona 매핑 (id 기준)
+    persona_by_id = {}
+    try:
+        with open(QA_DATASET_PATH, encoding="utf-8") as f:
+            for q in json.load(f):
+                qid = str(q.get("id", "")).strip()
+                if qid:
+                    persona_by_id[qid] = q.get("persona", "")
+    except Exception:
+        pass
+
+    ws = wb.create_sheet("③ 세부지표")
+
+    # 컬럼 헤더 + 너비 정의 (paper raw analysis 용)
+    columns = [
+        ("번호", 6),
+        ("분류", 12),
+        ("페르소나", 18),
+        ("질문", 40),
+        ("정답", 40),
+        ("정답 길이", 10),
+        # ─ Vector ─
+        ("V_verdict", 10),
+        ("V_정답여부", 10),
+        ("V_답변", 40),
+        ("V_답변길이", 10),
+        ("V_judge사유", 30),
+        ("V_sources", 30),
+        ("V_sources_count", 10),
+        ("V_scored_sources", 30),
+        ("V_context_preview", 40),
+        ("V_error", 20),
+        # ─ Hybrid ─
+        ("H_verdict", 10),
+        ("H_정답여부", 10),
+        ("H_답변", 40),
+        ("H_답변길이", 10),
+        ("H_judge사유", 30),
+        ("H_sources", 30),
+        ("H_sources_count", 10),
+        ("H_scored_sources", 30),
+        ("H_context_preview", 40),
+        ("H_graph_count", 10),
+        ("H_graph_preview", 30),
+        ("H_error", 20),
+    ]
+    headers = [c[0] for c in columns]
+    widths = [c[1] for c in columns]
+    SUCCESS_COLS_DETAIL = {8, 18}  # V_정답여부, H_정답여부 (1-based)
+
+    from openpyxl.utils import get_column_letter
+    for i, (h, w) in enumerate(zip(headers, widths), start=1):
+        cell = ws.cell(row=1, column=i, value=h)
+        cell.font = H_FONT
+        cell.fill = BLUE_FILL
+        cell.alignment = AL_C
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 30
+
+    for idx, r in enumerate(rows, start=2):
+        v_str = "정답" if r.get("vector_success") is True else "오답"
+        h_str = "정답" if r.get("hybrid_success") is True else "오답"
+        v_sources_str = r.get("vector_sources", "") or ""
+        h_sources_str = r.get("hybrid_sources", "") or ""
+        v_src_count = len([s for s in v_sources_str.split(" | ") if s.strip()])
+        h_src_count = len([s for s in h_sources_str.split(" | ") if s.strip()])
+
+        data = [
+            r.get("id", ""),
+            r.get("category", ""),
+            persona_by_id.get(str(r.get("id", "")), ""),
+            r.get("question", ""),
+            r.get("ground_truth", ""),
+            len(r.get("ground_truth", "") or ""),
+            # Vector
+            r.get("vector_judge_verdict", ""),
+            v_str,
+            r.get("vector_answer", ""),
+            len(r.get("vector_answer", "") or ""),
+            r.get("vector_judge_reason", ""),
+            v_sources_str,
+            v_src_count,
+            r.get("vector_scored_sources", ""),
+            r.get("vector_context_preview", ""),
+            r.get("vector_error", ""),
+            # Hybrid
+            r.get("hybrid_judge_verdict", ""),
+            h_str,
+            r.get("hybrid_answer", ""),
+            len(r.get("hybrid_answer", "") or ""),
+            r.get("hybrid_judge_reason", ""),
+            h_sources_str,
+            h_src_count,
+            r.get("hybrid_scored_sources", ""),
+            r.get("hybrid_context_preview", ""),
+            r.get("hybrid_error", ""),
+            r.get("hybrid_graph_count", 0),
+            r.get("hybrid_graph_preview", ""),
+        ]
+        for col_idx, val in enumerate(data, start=1):
+            safe_val = _xlsx_safe(val)
+            cell = ws.cell(row=idx, column=col_idx, value=safe_val)
+            cell.font = N_FONT
+            if col_idx in SUCCESS_COLS_DETAIL:
+                cell.fill = SUCCESS_FILL if safe_val == "정답" else FAIL_FILL
+                cell.alignment = AL_TC
+            elif col_idx == 4:  # 질문 배경
+                cell.fill = Q_FILL
+                cell.alignment = AL_TL
+            else:
+                cell.alignment = AL_TL
+        ws.row_dimensions[idx].height = 15
+
+    ws.freeze_panes = "F2"  # 정답까지 고정
 
 
 # ── 경로 설정 ─────────────────────────────────────────────
@@ -565,12 +699,17 @@ def run_evaluation():
 
     df = pd.DataFrame(rows)
 
-    # 엑셀 저장
-    _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp)
-
-    # 원본 json 저장
+    # 원본 json 먼저 저장 (xlsx 가 실패해도 raw 결과는 보존되도록 순서 변경)
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
+    print(f" - JSON 저장 완료: {json_path}")
+
+    # xlsx 저장 (실패해도 JSON/summary 는 영향 없음)
+    try:
+        _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, timestamp)
+    except Exception as e:
+        print(f" - [xlsx 저장 실패] {type(e).__name__}: {str(e)[:200]}")
+        print(f"   JSON 결과는 보존됨: {json_path}")
 
     def _count_verdict(field, target):
         if df.empty or field not in df.columns:
