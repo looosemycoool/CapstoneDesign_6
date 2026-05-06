@@ -99,7 +99,10 @@ def vector_search(query, n_results=3):
 
 # ── 질문 키워드 추출 ─────────────────────────────────────
 def extract_keywords(query):
-    """질문에서 그래프 검색용 핵심 키워드 추출"""
+    """질문에서 그래프 검색용 핵심 키워드 추출.
+    조건해석형 질의 (e.g. "X 이수하면 Y 가능한가") 의 조건절 단어
+    ('하면', '되는가요' 등) 는 graph 노드 매칭에 도움 안 되어 제외하지만,
+    'X학점' / '3회' 같은 숫자+단위 짧은 토큰은 살린다 (조건 판정 핵심)."""
     stopwords = {
         "어떻게", "무엇", "뭐", "인가요", "있나요", "해주세요", "알려줘",
         "알려주세요", "가능한가요", "되는가요", "관련", "대한", "에서",
@@ -112,8 +115,8 @@ def extract_keywords(query):
 
     for token in cleaned.split():
         token = token.strip()
-        # 한글 2자 미만은 노이즈 (조사 잔재 등). 영숫자는 2자 허용.
-        if len(token) < 2:
+        # 2자 미만 컷, 단 숫자 포함 토큰 (학점/회차 등) 은 1자도 살림
+        if len(token) < 2 and not re.search(r"\d", token):
             continue
         if token in stopwords:
             continue
@@ -129,16 +132,20 @@ def extract_keywords(query):
 
     # 긴 키워드(고유명사/복합어일 가능성)를 우선해서 graph 매칭 정밀도 향상.
     # "스타트업" 같은 짧은 일반어보다 "K-스타트업 2025" 같은 specific 토큰을 먼저 사용.
+    # top-k 5 → 8 로 확대 (한국어는 띄어쓰기 단위로 7-12 토큰이 흔함, 5 컷이면
+    # 조건해석형 질의의 핵심 어휘가 잘림).
     unique_tokens.sort(key=lambda t: -len(t))
-    return unique_tokens[:5]
+    return unique_tokens[:8]
 
 
 # ── Graph 검색 ───────────────────────────────────────────
 def _score_relation(rel, keywords):
-    """질문 키워드와의 매칭 점수. 정확 일치 가중치 부여.
-    낮은 점수의 무관한 관계가 LLM context 의 절반을 차지해 답변 품질을
-    저하시키던 문제를 해결하기 위한 필터링용."""
-    score = 0
+    """질문 키워드와의 매칭 점수. 정확 일치 + 부분 일치 길이 비율 가중.
+    이전엔 정확 +3 / 부분 +1 단순 점수라, LLM 이 만든 긴 노드명
+    ('2026년도 컴퓨터학부 조기졸업요건' 등) 에서 정확 일치가 거의 안 나와
+    대부분 +1 로 깔려 정렬이 무의미했음. 부분 일치는 키워드가 노드명에서
+    차지하는 비중에 비례해 가중 (specific 매칭일수록 점수 ↑)."""
+    score = 0.0
     from_node = rel.get("from", "")
     to_node = rel.get("to", "")
     for kw in keywords:
@@ -146,13 +153,13 @@ def _score_relation(rel, keywords):
             continue
         # 양쪽 노드 정확 일치 = 강한 단서
         if kw == from_node:
-            score += 3
+            score += 5
         elif kw in from_node:
-            score += 1
+            score += 1 + (len(kw) / max(len(from_node), 1)) * 2
         if kw == to_node:
-            score += 3
+            score += 5
         elif kw in to_node:
-            score += 1
+            score += 1 + (len(kw) / max(len(to_node), 1)) * 2
     return score
 
 
@@ -249,30 +256,56 @@ def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
     driver.close()
 
     # 키워드 매칭 점수가 0 인 관계는 노이즈로 보고 제거, 그 외는 점수순 정렬.
+    # 동점일 때 from_node 알파벳 순으로 tiebreak — 평가 재현성 확보.
     scored = [(r, _score_relation(r, keywords)) for r in results]
     scored = [(r, s) for r, s in scored if s > 0]
-    scored.sort(key=lambda x: -x[1])
+    scored.sort(key=lambda x: (-x[1], x[0].get("from", "")))
     return [r for r, _ in scored[:max_relations]]
+
+
+# ── Graph 관계 타입을 한국어 술어로 변환 (LLM 가독성 ↑) ──────
+# "X --REQUIRES--> Y" 같은 ASCII art 보다 자연어가 답변 활용도 높음.
+REL_KO = {
+    "REQUIRES":      "는 다음을 요구함:",
+    "HAS_DEADLINE":  "의 마감일:",
+    "HAS_CONDITION": "의 조건:",
+    "TARGETS":       "의 대상:",
+    "PROVIDES":      "는 다음을 제공함:",
+    "OFFERS":        "는 다음을 제공:",
+    "REWARDS":       "는 다음에 보상함:",
+    "PART_OF":       "는 다음의 일부:",
+    "BELONGS_TO":    "는 다음에 속함:",
+    "APPLIES_TO":    "는 다음에 적용됨:",
+    "RELATED_TO":    "는 관련됨:",
+    "MENTIONS":      "에서 언급됨:",
+}
 
 
 # ── 결과 통합 ─────────────────────────────────────────────
 def merge_results(vector_docs, graph_relations):
-    """Vector + Graph 결과를 컨텍스트 문자열로 통합"""
+    """Vector + Graph 결과를 컨텍스트 문자열로 통합.
+
+    핵심 변경: graph 블록을 vector 보다 *앞*에 배치 (위치 가중치로 인한
+    graph 신호 약화 방지). 조건/관계 판정에서는 graph 가 결정적이며,
+    서술/배경 정보는 vector 본문에서 가져오는 게 자연스럽다.
+    triple 표현은 한국어 술어로 변환해 LLM 가독성/활용도 향상.
+    """
     context_parts = []
 
+    if graph_relations:
+        graph_text = "=== 핵심 관계/조건 단서 (조건·자격·대상 판정용) ===\n"
+        for rel in graph_relations:
+            if rel["from"] and rel["to"]:
+                verb = REL_KO.get(rel["relation"], f"--[{rel['relation']}]-->")
+                graph_text += f"- {rel['from']} {verb} {rel['to']}\n"
+        context_parts.append(graph_text.strip())
+
     if vector_docs:
-        vector_text = "=== 문서 검색 결과 ===\n"
+        vector_text = "=== 문서 본문 (서술·배경 근거용) ===\n"
         for i, doc in enumerate(vector_docs, start=1):
             vector_text += f"\n[{i}] 출처: {doc['source']} (유사도: {doc['score']})\n"
             vector_text += f"{doc['content']}\n"
         context_parts.append(vector_text.strip())
-
-    if graph_relations:
-        graph_text = "=== 관계 그래프 검색 결과 ===\n"
-        for rel in graph_relations:
-            if rel["from"] and rel["to"]:
-                graph_text += f"- {rel['from']} --[{rel['relation']}]--> {rel['to']}\n"
-        context_parts.append(graph_text.strip())
 
     return "\n\n".join(context_parts).strip()
 
@@ -290,11 +323,11 @@ def generate_answer(query, context, model=GENERATION_MODEL):
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
 
 아래 검색 결과를 바탕으로 질문에 답변하세요. 검색 결과는 두 가지로 구성됩니다:
-- [문서 검색 결과]: 공지/문서의 실제 본문. **답변의 주된 근거**로 사용하세요.
-- [관계 그래프 검색 결과]: 개체 간 관계 단서. 보조 정보로만 사용하고, 본문과 모순되거나 본문에 직접적인 답이 있으면 본문을 우선하세요.
+- [핵심 관계/조건 단서]: 지식 그래프에서 추출한 개체 간 조건·자격·대상·요구사항 관계. **조건 판정형 질문(자격/요건/대상/기한 등)에서 결정적 근거**로 사용하세요. 본문에 명시 안 된 조건이나 관계도 단서가 일치하면 답변에 반영하세요.
+- [문서 본문]: 공지/문서의 실제 서술. **배경 설명·구체 수치·인용**의 근거로 사용하세요.
 
-반드시 검색 결과에 근거해서만 답변하세요.
-검색 결과에 없는 내용은 추측하지 말고 "해당 정보를 찾을 수 없습니다."라고 답변하세요.
+두 정보가 충돌할 경우: 사실(날짜·금액·수치)은 본문이 우선, 자격/대상/조건 관계는 단서가 우선.
+반드시 검색 결과에 근거해서만 답변하세요. 검색 결과에 없는 내용은 추측하지 말고 "해당 정보를 찾을 수 없습니다."라고 답변하세요.
 
 [검색 결과]
 {context}
