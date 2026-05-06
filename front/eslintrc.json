@@ -1,0 +1,90 @@
+{
+  "env": {
+    "browser": true,
+    "es2021": true
+  },
+  "plugins": [
+    "@typescript-eslint",
+    "react",
+    "react-hooks",
+    "import",
+    "jsx-a11y"
+  ],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended",
+    "plugin:react/recommended",
+    "plugin:import/recommended",
+    "plugin:jsx-a11y/recommended"
+  ],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "ecmaFeatures": {
+      "jsx": true
+    },
+    "sourceType": "module"
+  },
+  "ignorePatterns": ["build", "dist", "public", "node_modules"],
+
+  "rules": {
+    // ─── React ───────────────────────────────────────────────
+    "react/jsx-filename-extension": ["warn", { "extensions": [".tsx"] }],
+    "react/react-in-jsx-scope": "off",
+    "react/jsx-uses-react": "off",
+    "react/prop-types": "off",                // TypeScript가 타입을 대신 보장하므로 off
+    "react/display-name": "off",              // 챗봇 컴포넌트는 익명 함수 패턴이 많으므로 off
+
+    // ─── React Hooks ─────────────────────────────────────────
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "warn",    // useEffect 의존성 누락 경고 (챗봇 스트리밍에서 중요)
+
+    // ─── TypeScript ──────────────────────────────────────────
+    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
+    "@typescript-eslint/no-explicit-any": "warn",           // any 타입 사용 경고
+    "@typescript-eslint/consistent-type-imports": "error",  // import type 구분 강제
+    "@typescript-eslint/no-floating-promises": "off",       // tsconfig에서 처리
+    "@typescript-eslint/no-non-null-assertion": "warn",     // ! 연산자 경고
+
+    // ─── Import ──────────────────────────────────────────────
+    "no-duplicate-imports": "error",
+    "import/newline-after-import": ["error", { "count": 1 }],
+    "import/no-unresolved": "off",
+    "import/order": [
+      "error",
+      {
+        "groups": [
+          "builtin",
+          "external",
+          "internal",
+          ["parent", "sibling"],
+          "index",
+          "type"
+        ],
+        "pathGroups": [
+          { "pattern": "react", "group": "builtin", "position": "after" },
+          { "pattern": "react-dom", "group": "builtin", "position": "after" },
+          { "pattern": "@/**", "group": "internal" }
+        ],
+        "pathGroupsExcludedImportTypes": ["react", "react-dom"],
+        "alphabetize": {
+          "order": "asc",
+          "caseInsensitive": true
+        },
+        "newlines-between": "always"
+      }
+    ],
+
+    // ─── 코드 품질 ────────────────────────────────────────────
+    "no-console": ["warn", { "allow": ["warn", "error", "info"] }],
+    "no-multiple-empty-lines": ["error", { "max": 1 }],
+    "no-undef": "error",
+    "no-trailing-spaces": "error",
+    "no-multi-spaces": "error",
+    "indent": "off",
+    "arrow-parens": ["error", "always"],
+
+    // ─── 접근성 (챗봇 UI 입력창, 버튼 등) ─────────────────────
+    "jsx-a11y/no-autofocus": "off"            // 챗봇 입력창 자동 포커스 허용
+  }
+}
