@@ -83,6 +83,20 @@ def find_libreoffice() -> str | None:
 
 LIBREOFFICE = find_libreoffice()
 
+# 한컴 COM 자동화 가용 여부 (Windows + 한컴오피스 설치 시에만 True)
+def _check_hancom_com() -> bool:
+    """한컴오피스 COM 객체 등록 여부 확인."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import win32com.client
+        win32com.client.Dispatch("HWPFrame.HwpObject")
+        return True
+    except Exception:
+        return False
+
+HANCOM_COM_AVAILABLE = _check_hancom_com()
+
 SUPPORTED_EXTS = {".pdf", ".hwp", ".hwpx", ".xlsx", ".xls", ".docx", ".txt", ".zip"}
 
 
@@ -276,6 +290,126 @@ def parse_pdf(file_path: str) -> str:
 
 # ── HWP / HWPX 파싱 ───────────────────────────────────────────────────────────
 
+def _hancom_com_extract(file_path: str) -> str:
+    """한컴오피스 COM 자동화로 HWP/HWPX 텍스트 추출 (Windows 전용).
+
+    - 한컴오피스가 로컬에 설치되어 있어야 합니다.
+    - 가장 정확한 방법으로, 표·각주·머리말 등 모든 요소를 처리합니다.
+    - pip install pywin32  (최초 1회)
+
+    동작 방식:
+      HWPFrame.HwpObject COM 객체를 생성 → 파일 열기 → GetTextFile("TEXT") 로
+      전체 텍스트 추출 → 오브젝트 종료. 프로세스 잔존을 막기 위해 반드시 Quit() 호출.
+    """
+    if not HANCOM_COM_AVAILABLE:
+        return ""
+    hwp = None
+    try:
+        import win32com.client
+        hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        # 보안 경고 팝업 억제
+        hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
+        hwp.Open(os.path.abspath(file_path), "HWP", "forceopen:true")
+        text = hwp.GetTextFile("TEXT", "")
+        return text.strip() if text else ""
+    except Exception as e:
+        print(f"  [COM 오류] {os.path.basename(file_path)}: {e}")
+        return ""
+    finally:
+        try:
+            if hwp:
+                hwp.Quit()
+        except Exception:
+            pass
+
+
+def _parse_hwpx_native(file_path: str) -> str:
+    """HWPX 파일을 ZIP+XML 구조로 직접 파싱합니다 (외부 도구 불필요).
+
+    HWPX 포맷 구조:
+      HWPX는 ZIP 아카이브이며, 본문은 Contents/section0.xml ~ sectionN.xml 에 위치.
+      각 section XML의 텍스트 노드(hp:t 태그)를 순서대로 읽어 텍스트를 추출합니다.
+
+    표 처리:
+      hp:tbl(표) → hp:tr(행) → hp:tc(셀) 구조를 인식하여 Markdown 표로 변환합니다.
+
+    한계:
+      - 이미지, 수식, 그리기 개체 내부 텍스트는 추출되지 않습니다.
+      - 복잡한 레이아웃(다단, 글상자)은 읽기 순서가 다소 어긋날 수 있습니다.
+    """
+    import xml.etree.ElementTree as ET
+
+    # HWPX XML 네임스페이스
+    NS = {
+        "hp": "http://www.hancom.co.kr/hwpml/2012/paragraph",
+        "hc": "http://www.hancom.co.kr/hwpml/2012/core",
+        "hs": "http://www.hancom.co.kr/hwpml/2012/section",
+    }
+
+    def _elem_text(elem) -> str:
+        """hp:t 태그에서 텍스트를 모아 반환합니다."""
+        parts = []
+        for t in elem.iter("{http://www.hancom.co.kr/hwpml/2012/paragraph}t"):
+            if t.text:
+                parts.append(t.text)
+        return "".join(parts)
+
+    def _parse_table(tbl_elem) -> str:
+        """hp:tbl 요소를 Markdown 표로 변환합니다."""
+        rows_md: list[str] = []
+        tr_tag  = "{http://www.hancom.co.kr/hwpml/2012/paragraph}tr"
+        tc_tag  = "{http://www.hancom.co.kr/hwpml/2012/paragraph}tc"
+        for tr in tbl_elem.iter(tr_tag):
+            cells = [_elem_text(tc).replace("\n", " ").strip() for tc in tr.iter(tc_tag)]
+            if any(cells):
+                rows_md.append("| " + " | ".join(cells) + " |")
+        if not rows_md:
+            return ""
+        header    = rows_md[0]
+        separator = "| " + " | ".join(["---"] * (header.count("|") - 1)) + " |"
+        return "\n".join([header, separator] + rows_md[1:])
+
+    result: list[str] = []
+    try:
+        with zipfile.ZipFile(file_path, "r") as z:
+            section_files = sorted(
+                name for name in z.namelist()
+                if name.startswith("Contents/section") and name.endswith(".xml")
+            )
+            if not section_files:
+                print(f"  [HWPX] section XML 없음: {os.path.basename(file_path)}")
+                return ""
+
+            p_tag   = "{http://www.hancom.co.kr/hwpml/2012/paragraph}p"
+            tbl_tag = "{http://www.hancom.co.kr/hwpml/2012/paragraph}tbl"
+
+            for sec_name in section_files:
+                with z.open(sec_name) as f:
+                    root = ET.parse(f).getroot()
+                # 단락(p)과 표(tbl)를 문서 순서대로 처리
+                for elem in root.iter():
+                    tag = elem.tag
+                    if tag == tbl_tag:
+                        md_table = _parse_table(elem)
+                        if md_table:
+                            result.append(md_table)
+                        # 표 내부 단락은 이미 처리했으므로 skip 처리를 위해 태그 제거
+                        elem.tag = "__processed__"
+                    elif tag == p_tag:
+                        text = _elem_text(elem).strip()
+                        if text:
+                            result.append(text)
+
+    except zipfile.BadZipFile:
+        print(f"  [HWPX] ZIP 구조 아님 또는 손상된 파일: {os.path.basename(file_path)}")
+        return ""
+    except Exception as e:
+        print(f"  [HWPX XML 파싱 오류] {os.path.basename(file_path)}: {e}")
+        return ""
+
+    return "\n".join(result)
+
+
 def _libreoffice_convert(file_path: str, fmt: str, ext: str) -> str | None:
     """LibreOffice로 변환 후 결과 파일 경로 반환 (실패 시 None)."""
     if not LIBREOFFICE:
@@ -316,15 +450,39 @@ def _hwp5txt_extract(file_path: str) -> str:
 
 
 def parse_hwp(file_path: str) -> str:
-    """HWP/HWPX 파싱: 3단계 fallback 전략.
+    """HWP/HWPX 파싱: 4~5단계 fallback 전략.
 
-    1차) LibreOffice → PDF → opendataloader (표·레이아웃 보존 최우선)
-    2차) pyhwp hwp5txt (LibreOffice가 거부하는 HWP에 강함. .hwpx 미지원)
-    3차) LibreOffice → TXT (최후 수단)
+    HWP 우선순위:
+      1) 한컴오피스 COM 자동화  (Windows + 한컴오피스 설치 시, 가장 정확)
+      2) LibreOffice → PDF → opendataloader  (표·레이아웃 보존)
+      3) pyhwp hwp5txt  (LibreOffice가 거부하는 HWP에 강함)
+      4) LibreOffice → TXT  (최후 수단)
+
+    HWPX 우선순위:
+      1) 한컴오피스 COM 자동화  (Windows + 한컴오피스 설치 시)
+      2) HWPX 네이티브 XML 파싱  (외부 도구 불필요, 표 포함)
+      3) LibreOffice → PDF → opendataloader
+      4) LibreOffice → TXT
     """
     ext = os.path.splitext(file_path)[1].lower()
 
-    # 1차: LibreOffice → PDF → opendataloader + pdfplumber 보강
+    # ── 1단계: 한컴오피스 COM 자동화 (Windows 전용, 가장 정확) ──────────────
+    if HANCOM_COM_AVAILABLE:
+        text = _hancom_com_extract(file_path)
+        if text:
+            print("  [한컴 COM으로 추출 성공]")
+            return text
+        print("  [Fallback] COM 결과 비어 있음 - 다음 방법 시도")
+
+    # ── 2단계 (HWPX 전용): 네이티브 XML 파싱 ─────────────────────────────────
+    if ext == ".hwpx":
+        text = _parse_hwpx_native(file_path)
+        if text:
+            print("  [HWPX 네이티브 XML로 추출 성공]")
+            return text
+        print("  [Fallback] HWPX XML 결과 비어 있음 - 다음 방법 시도")
+
+    # ── 3단계: LibreOffice → PDF → opendataloader + pdfplumber 보강 ──────────
     pdf_path = _libreoffice_convert(file_path, "pdf", "pdf")
     if pdf_path:
         try:
@@ -341,14 +499,14 @@ def parse_hwp(file_path: str) -> str:
             return text
         print("  [Fallback] HWP→PDF 결과 비어 있음 - 다음 방법 시도")
 
-    # 2차: pyhwp (.hwpx 미지원)
+    # ── 4단계: pyhwp hwp5txt (.hwpx 미지원) ──────────────────────────────────
     if ext == ".hwp":
         text = _hwp5txt_extract(file_path)
         if text:
             print("  [pyhwp로 추출 성공]")
             return text
 
-    # 3차: LibreOffice → TXT
+    # ── 5단계: LibreOffice → TXT (최후 수단) ─────────────────────────────────
     txt_path = _libreoffice_convert(file_path, "txt:Text", "txt")
     if not txt_path:
         return ""
@@ -724,6 +882,12 @@ if __name__ == "__main__":
         print("       - Windows: C:\\Program Files\\LibreOffice\\program\\soffice.exe 설치 확인")
     else:
         print(f"[LibreOffice] {LIBREOFFICE}")
+
+    if HANCOM_COM_AVAILABLE:
+        print("[한컴 COM] 한컴오피스 COM 자동화 사용 가능 → HWP/HWPX 최고 품질로 파싱")
+    else:
+        print("[한컴 COM] 사용 불가 (Windows + 한컴오피스 설치 환경에서만 동작)")
+        print("           HWPX는 네이티브 XML 파싱으로 대체됩니다.")
 
     # 1. 기존 공지사항 첨부파일 파싱
     # parse_all()
