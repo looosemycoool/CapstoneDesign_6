@@ -185,51 +185,61 @@ RELATION_TYPE_WEIGHT = {
 }
 
 
-def graph_search(query, vector_docs=None, max_relations=5):
-    """Vector-anchored, relation-centric GraphRAG.
+GRAPH_NODES_COLLECTION = "knu_cse_graph_nodes"  # build_graph_embeddings.py 가 생성
 
-    이전 keyword CONTAINS 기반 → 동의어/약어 못 잡고, MENTIONS 메타관계가
-    노이즈로 들어가던 문제 해결.
 
-    설계:
-    1. Anchor: vector_docs 의 출처 문서가 MENTIONS 한 entity 들이 graph 진입점
-       → vector 가 이미 "관련 있다" 인정한 entity 만 사용 (정밀도 ↑)
-    2. Relation-centric expansion: anchor 에서 1-hop, 단 의미 관계만
-       (MEANINGFUL_RELATIONS), Document 노드 제외
-    3. Score = anchor confidence × relation type weight × subgraph cohesion
-       × hub penalty (일반 entity 디스카운트)
+def graph_search(query, vector_docs=None, max_relations=5, n_seed_nodes=8):
+    """Embedding-based semantic GraphRAG.
 
-    vector_docs 가 None 이면 keyword 기반 fallback (호환성).
+    이전 keyword CONTAINS / vector_docs anchor 기반 → 한국어 동의어/약어
+    매칭 약함, MENTIONS 메타관계 노이즈, vector 의존성 등 문제.
+
+    새 설계 (정통 GraphRAG 패턴):
+    1. 사전 임베딩된 graph 노드 (knu_cse_graph_nodes Chroma collection)
+       에서 query 와 의미 유사 top-k seed 선택
+    2. 각 seed 에서 1-hop 의미 관계 (MEANINGFUL_RELATIONS) expansion
+    3. Score = seed similarity × relation type weight × subgraph cohesion
+              × hub penalty
+
+    vector_docs 는 호환성을 위해 시그니처에 유지 (사용 안 함).
     """
-    if not vector_docs:
-        return []  # vector 없으면 anchor 없음 — graph 검색 불가
+    embedding_fn = get_query_embedding_function()
+    chroma = get_chroma_client()
 
+    # graph_nodes collection 존재 확인
+    existing = list(chroma.list_collections())
+    if GRAPH_NODES_COLLECTION not in existing:
+        # 임베딩 안 됐으면 빈 결과 (build_graph_embeddings.py 안 돌린 케이스)
+        return []
+
+    coll = chroma.get_collection(GRAPH_NODES_COLLECTION)
+
+    # [1] query 임베딩 → top-k seed nodes
+    q_emb = embedding_fn.embed_query(query)
+    res = coll.query(query_embeddings=[q_emb], n_results=n_seed_nodes)
+    seed_ids = res.get("ids", [[]])[0]
+    seed_metas = res.get("metadatas", [[]])[0]
+    seed_distances = res.get("distances", [[]])[0]
+
+    if not seed_ids:
+        return []
+
+    # similarity: cosine distance → similarity (1 - distance / 2 가정, 실제 metric 에 따라 다를 수 있음)
+    # 정확한 변환보다 상대 점수가 중요해서 단순 1/(1+dist) 사용
+    seeds = []  # [(elementId, name, similarity)]
+    for sid, meta, dist in zip(seed_ids, seed_metas, seed_distances):
+        sim = 1.0 / (1.0 + max(0.0, dist or 0))
+        seeds.append((sid, meta.get("name", ""), sim))
+
+    seed_names = {s[1] for s in seeds if s[1]}
+
+    # [2] 각 seed 에서 1-hop expansion (Neo4j)
     driver = get_neo4j_driver()
-    triples = []
-    seen = {}
+    seen = {}  # (from, rel, to) -> {score, ...}
 
     try:
         with driver.session() as session:
-            # [1] Anchor: vector 가 가져온 문서들이 mention 한 entity
-            files = list({d.get("source", "") for d in vector_docs if d.get("source")})
-            if not files:
-                return []
-
-            anchor_rows = session.run("""
-                MATCH (d:Document)-[:MENTIONS]->(e)
-                WHERE d.file_name IN $files AND NOT e:Document
-                RETURN DISTINCT
-                    coalesce(e.name, '') AS name,
-                    elementId(e) AS id
-            """, {"files": files}).data()
-
-            anchors = [(r["name"], r["id"]) for r in anchor_rows if r.get("name")]
-            if not anchors:
-                return []
-            anchor_set = {n for n, _ in anchors}
-
-            # [2] Anchor 별 1-hop 의미 관계 expansion (양방향, MENTIONS 제외)
-            for anchor_name, anchor_id in anchors:
+            for seed_id, seed_name, sim in seeds:
                 rows = session.run("""
                     MATCH (a)-[r]-(b)
                     WHERE elementId(a) = $id
@@ -242,7 +252,7 @@ def graph_search(query, vector_docs=None, max_relations=5):
                         coalesce(b.name, '') AS neighbor_name,
                         COUNT { (b)--() } AS neighbor_degree
                     LIMIT 15
-                """, {"id": anchor_id, "types": MEANINGFUL_RELATIONS}).data()
+                """, {"id": seed_id, "types": MEANINGFUL_RELATIONS}).data()
 
                 for row in rows:
                     from_n = (row.get("from_name") or "").strip()
@@ -255,23 +265,22 @@ def graph_search(query, vector_docs=None, max_relations=5):
                         continue
 
                     # 점수 계산
-                    score = 1.0  # base from anchor
+                    score = sim  # base = seed semantic similarity
 
                     # (a) Relation type 가중
                     score *= RELATION_TYPE_WEIGHT.get(rel, 1.0)
 
-                    # (b) Subgraph cohesion: neighbor 도 anchor 면 강한 신호
-                    if neighbor in anchor_set:
+                    # (b) Subgraph cohesion: neighbor 도 seed 중 하나면 강한 신호
+                    if neighbor in seed_names:
                         score *= 1.5
 
-                    # (c) Hub penalty: '학생', '경북대학교' 같은 일반 entity
+                    # (c) Hub penalty
                     if neighbor_deg > 20:
                         score *= 0.5
                     elif neighbor_deg > 10:
                         score *= 0.7
 
                     key = (from_n, rel, to_n)
-                    # 중복 시 더 높은 점수만 유지
                     if key not in seen or seen[key]["score"] < score:
                         seen[key] = {
                             "from": from_n, "relation": rel, "to": to_n,
@@ -280,13 +289,11 @@ def graph_search(query, vector_docs=None, max_relations=5):
     finally:
         driver.close()
 
-    # 점수순 정렬, top-k. 동점은 from 명 알파벳 순 (재현성).
     triples = sorted(seen.values(), key=lambda x: (-x["score"], x["from"]))
-    # score 필드는 외부 contract 와 다르므로 제거
-    result = []
-    for t in triples[:max_relations]:
-        result.append({"from": t["from"], "relation": t["relation"], "to": t["to"]})
-    return result
+    return [
+        {"from": t["from"], "relation": t["relation"], "to": t["to"]}
+        for t in triples[:max_relations]
+    ]
 
 
 # ── Graph 관계 타입을 한국어 술어로 변환 (LLM 가독성 ↑) ──────
