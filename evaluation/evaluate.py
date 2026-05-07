@@ -311,7 +311,10 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
             r.get("vector_scored_sources", ""),
             r.get("vector_context_preview", ""),
             r.get("vector_error", ""),
-            # Hybrid
+            # Hybrid — columns 정의 순서와 동일하게 유지 (CodeRabbit 지적 fix):
+            # H_verdict, H_정답여부, H_답변, H_답변길이, H_judge사유, H_sources,
+            # H_sources_count, H_scored_sources, H_context_preview,
+            # H_graph_count, H_graph_preview, H_error
             r.get("hybrid_judge_verdict", ""),
             h_str,
             r.get("hybrid_answer", ""),
@@ -321,9 +324,9 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
             h_src_count,
             r.get("hybrid_scored_sources", ""),
             r.get("hybrid_context_preview", ""),
-            r.get("hybrid_error", ""),
             r.get("hybrid_graph_count", 0),
             r.get("hybrid_graph_preview", ""),
+            r.get("hybrid_error", ""),
         ]
         for col_idx, val in enumerate(data, start=1):
             safe_val = _xlsx_safe(val)
