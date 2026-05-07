@@ -163,104 +163,130 @@ def _score_relation(rel, keywords):
     return score
 
 
-def graph_search(query, max_nodes_per_keyword=5, max_relations=5):
-    """Neo4j에서 키워드 기반 관계 탐색.
-    이전엔 max_relations=20 으로 너무 많은 무관한 관계까지 LLM 에 넘겨 hybrid
-    답변 품질이 vector 단독보다 떨어지던 문제가 있었다.
-    이제 키워드 매칭 점수 상위 5개만 반환."""
+# 의미 관계 화이트리스트 — MENTIONS 같은 메타 관계 제외하고 실제 의미를
+# 가진 관계만 graph traversal 에 포함. (MENTIONS 는 전체 관계의 55.8% 차지하나
+# Document → Entity 자동 메타라 hybrid 답변에 노이즈로 작용.)
+MEANINGFUL_RELATIONS = [
+    "REQUIRES", "HAS_CONDITION", "HAS_DEADLINE", "TARGETS",
+    "OFFERS", "PROVIDES", "INCLUDES", "PART_OF", "BELONGS_TO",
+    "APPLIES_TO", "EXCLUDES", "RELATED_TO", "CHARGES",
+    "REWARDS", "ACCEPTS", "REFERS",
+]
+
+# 조건/대상 판정에 결정적인 관계 타입에 가중치 부여
+RELATION_TYPE_WEIGHT = {
+    "REQUIRES": 1.5, "HAS_CONDITION": 1.5,
+    "TARGETS": 1.3, "HAS_DEADLINE": 1.3,
+    "OFFERS": 1.2, "PROVIDES": 1.2, "INCLUDES": 1.2,
+    "EXCLUDES": 1.2, "APPLIES_TO": 1.2,
+    "PART_OF": 1.0, "BELONGS_TO": 1.0,
+    "RELATED_TO": 0.8, "CHARGES": 1.1,
+    "REWARDS": 1.0, "ACCEPTS": 1.0, "REFERS": 0.8,
+}
+
+
+def graph_search(query, vector_docs=None, max_relations=5):
+    """Vector-anchored, relation-centric GraphRAG.
+
+    이전 keyword CONTAINS 기반 → 동의어/약어 못 잡고, MENTIONS 메타관계가
+    노이즈로 들어가던 문제 해결.
+
+    설계:
+    1. Anchor: vector_docs 의 출처 문서가 MENTIONS 한 entity 들이 graph 진입점
+       → vector 가 이미 "관련 있다" 인정한 entity 만 사용 (정밀도 ↑)
+    2. Relation-centric expansion: anchor 에서 1-hop, 단 의미 관계만
+       (MEANINGFUL_RELATIONS), Document 노드 제외
+    3. Score = anchor confidence × relation type weight × subgraph cohesion
+       × hub penalty (일반 entity 디스카운트)
+
+    vector_docs 가 None 이면 keyword 기반 fallback (호환성).
+    """
+    if not vector_docs:
+        return []  # vector 없으면 anchor 없음 — graph 검색 불가
+
     driver = get_neo4j_driver()
-    results = []
-    seen = set()
-    keywords = extract_keywords(query)
+    triples = []
+    seen = {}
 
-    with driver.session() as session:
-        for keyword in keywords:
-            node_result = session.run("""
-                MATCH (n)
-                WHERE coalesce(n.name, '') CONTAINS $keyword
-                    OR coalesce(n.title, '') CONTAINS $keyword
-                    OR ANY(f IN coalesce(n.source_files, []) WHERE f CONTAINS $keyword)
-                RETURN
-                    elementId(n) AS node_id,
-                    coalesce(n.name, n.title, n.file_name, '') AS node_name
-                LIMIT $limit
-            """, {
-                "keyword": keyword,
-                "limit": max_nodes_per_keyword
-            })
+    try:
+        with driver.session() as session:
+            # [1] Anchor: vector 가 가져온 문서들이 mention 한 entity
+            files = list({d.get("source", "") for d in vector_docs if d.get("source")})
+            if not files:
+                return []
 
-            nodes = node_result.data()
+            anchor_rows = session.run("""
+                MATCH (d:Document)-[:MENTIONS]->(e)
+                WHERE d.file_name IN $files AND NOT e:Document
+                RETURN DISTINCT
+                    coalesce(e.name, '') AS name,
+                    elementId(e) AS id
+            """, {"files": files}).data()
 
-            for node in nodes:
-                node_id = node.get("node_id")
-                node_name = (node.get("node_name") or "").strip()
-                if not node_id or not node_name:
-                    continue
+            anchors = [(r["name"], r["id"]) for r in anchor_rows if r.get("name")]
+            if not anchors:
+                return []
+            anchor_set = {n for n, _ in anchors}
 
-                # 정방향 관계
-                rel_result = session.run("""
-                    MATCH (a)-[r]->(b)
-                    WHERE elementId(a) = $node_id
+            # [2] Anchor 별 1-hop 의미 관계 expansion (양방향, MENTIONS 제외)
+            for anchor_name, anchor_id in anchors:
+                rows = session.run("""
+                    MATCH (a)-[r]-(b)
+                    WHERE elementId(a) = $id
+                      AND NOT b:Document
+                      AND type(r) IN $types
                     RETURN
-                        coalesce(a.name, a.title, a.file_name, '') AS from_node,
+                        coalesce(startNode(r).name, '') AS from_name,
                         type(r) AS rel,
-                        coalesce(b.name, b.title, b.file_name, '') AS to_node
-                    LIMIT 10
-                """, {"node_id": node_id})
+                        coalesce(endNode(r).name, '') AS to_name,
+                        coalesce(b.name, '') AS neighbor_name,
+                        COUNT { (b)--() } AS neighbor_degree
+                    LIMIT 15
+                """, {"id": anchor_id, "types": MEANINGFUL_RELATIONS}).data()
 
-                for row in rel_result.data():
-                    from_node = (row.get("from_node") or "").strip()
+                for row in rows:
+                    from_n = (row.get("from_name") or "").strip()
+                    to_n = (row.get("to_name") or "").strip()
                     rel = (row.get("rel") or "").strip()
-                    to_node = (row.get("to_node") or "").strip()
+                    neighbor = (row.get("neighbor_name") or "").strip()
+                    neighbor_deg = row.get("neighbor_degree") or 1
 
-                    if not from_node or not to_node:
+                    if not from_n or not to_n or not rel:
                         continue
 
-                    key = (from_node, rel, to_node)
-                    if key not in seen:
-                        results.append({
-                            "from": from_node,
-                            "relation": rel,
-                            "to": to_node
-                        })
-                        seen.add(key)
+                    # 점수 계산
+                    score = 1.0  # base from anchor
 
-                # 역방향 관계
-                rev_result = session.run("""
-                    MATCH (a)-[r]->(b)
-                    WHERE elementId(b) = $node_id
-                    RETURN
-                        coalesce(a.name, a.title, a.file_name, '') AS from_node,
-                        type(r) AS rel,
-                        coalesce(b.name, b.title, b.file_name, '') AS to_node
-                    LIMIT 10
-                """, {"node_id": node_id})
+                    # (a) Relation type 가중
+                    score *= RELATION_TYPE_WEIGHT.get(rel, 1.0)
 
-                for row in rev_result.data():
-                    from_node = (row.get("from_node") or "").strip()
-                    rel = (row.get("rel") or "").strip()
-                    to_node = (row.get("to_node") or "").strip()
+                    # (b) Subgraph cohesion: neighbor 도 anchor 면 강한 신호
+                    if neighbor in anchor_set:
+                        score *= 1.5
 
-                    if not from_node or not to_node:
-                        continue
+                    # (c) Hub penalty: '학생', '경북대학교' 같은 일반 entity
+                    if neighbor_deg > 20:
+                        score *= 0.5
+                    elif neighbor_deg > 10:
+                        score *= 0.7
 
-                    key = (from_node, rel, to_node)
-                    if key not in seen:
-                        results.append({
-                            "from": from_node,
-                            "relation": rel,
-                            "to": to_node
-                        })
-                        seen.add(key)
+                    key = (from_n, rel, to_n)
+                    # 중복 시 더 높은 점수만 유지
+                    if key not in seen or seen[key]["score"] < score:
+                        seen[key] = {
+                            "from": from_n, "relation": rel, "to": to_n,
+                            "score": score,
+                        }
+    finally:
+        driver.close()
 
-    driver.close()
-
-    # 키워드 매칭 점수가 0 인 관계는 노이즈로 보고 제거, 그 외는 점수순 정렬.
-    # 동점일 때 from_node 알파벳 순으로 tiebreak — 평가 재현성 확보.
-    scored = [(r, _score_relation(r, keywords)) for r in results]
-    scored = [(r, s) for r, s in scored if s > 0]
-    scored.sort(key=lambda x: (-x[1], x[0].get("from", "")))
-    return [r for r, _ in scored[:max_relations]]
+    # 점수순 정렬, top-k. 동점은 from 명 알파벳 순 (재현성).
+    triples = sorted(seen.values(), key=lambda x: (-x["score"], x["from"]))
+    # score 필드는 외부 contract 와 다르므로 제거
+    result = []
+    for t in triples[:max_relations]:
+        result.append({"from": t["from"], "relation": t["relation"], "to": t["to"]})
+    return result
 
 
 # ── Graph 관계 타입을 한국어 술어로 변환 (LLM 가독성 ↑) ──────
@@ -379,7 +405,8 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
 
     if use_graph:
         try:
-            graph_relations = graph_search(query)
+            # vector 결과를 anchor 로 활용 (vector-anchored GraphRAG)
+            graph_relations = graph_search(query, vector_docs=vector_docs)
             if verbose:
                 print(f"\n[Graph 검색] {len(graph_relations)}개 관계 탐색됨")
                 for rel in graph_relations[:5]:
