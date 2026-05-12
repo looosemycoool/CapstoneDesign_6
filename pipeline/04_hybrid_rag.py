@@ -29,13 +29,19 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password1234")
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
-# 임베딩 backend 선택 — env EMBED_BACKEND={upstage|bge} (기본 upstage).
+# 임베딩 backend 선택 — env EMBED_BACKEND={upstage|bge|contextual} (기본 upstage).
 # upstage: collection knu_cse_upstage_pro, embedding-passage/query (API)
 # bge: collection knu_cse_bge_m3_ko, dragonkue/bge-m3-ko (local, AutoRAG-ko 0.7456)
+#   → 우리 도메인엔 -6 효과로 폐기 (Phase 7b)
+# contextual: collection knu_cse_upstage_contextual, Anthropic Contextual Retrieval
+#   chunk 앞에 LLM 생성 doc 컨텍스트 prepend → 검색 정확도 -67% 실패율 보고
 EMBED_BACKEND = os.getenv("EMBED_BACKEND", "upstage")
 if EMBED_BACKEND == "bge":
     EXPERIMENT_ID = "bge_m3_ko"
     COLLECTION_NAME = "knu_cse_bge_m3_ko"
+elif EMBED_BACKEND == "contextual":
+    EXPERIMENT_ID = "upstage_contextual"
+    COLLECTION_NAME = "knu_cse_upstage_contextual"
 else:
     EXPERIMENT_ID = "upstage_pro"
     COLLECTION_NAME = f"knu_cse_{EXPERIMENT_ID}"
@@ -112,6 +118,12 @@ USE_BM25_HYBRID = os.getenv("USE_BM25_HYBRID", "0") == "1"  # Anthropic Contextu
 RETRIEVE_K = int(os.getenv("RETRIEVE_K", "10"))  # rerank 전 1차 dense 검색량
 BM25_K = int(os.getenv("BM25_K", "10"))            # BM25 1차 검색량
 RERANK_TO_K = int(os.getenv("RERANK_TO_K", "5"))  # rerank 후 최종
+
+# Phase 13 가설: rerank 가 vector 정확도 깎지만 (V↓6), graph anchor 의 시작점
+# 으로는 도움 (더 topically relevant chunks). 분리해서 vector 답변엔 raw,
+# graph anchor 엔 reranked 사용.
+# USE_RERANK=0 + RERANK_FOR_GRAPH_ANCHOR=1 → vector raw + graph anchor reranked.
+RERANK_FOR_GRAPH_ANCHOR = os.getenv("RERANK_FOR_GRAPH_ANCHOR", "0") == "1"
 
 # BM25 캐시 (lazy build) — Chroma 전체 dump 후 코퍼스 토큰화. 첫 query 만 비용.
 _BM25_CACHE = {"index": None, "docs": None}
@@ -441,6 +453,99 @@ def graph_search(query, vector_docs=None, max_relations=5, n_seed_nodes=8):
         {"from": t["from"], "relation": t["relation"], "to": t["to"]}
         for t in triples[:max_relations]
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Vector-anchored graph search (Phase 10) — body-grounded only
+# ═══════════════════════════════════════════════════════════════════
+# 동기 (Phase 8/9b 결과): query/embedding seed 기반 graph_search 가 vector
+# 본문과 disconnect 된 triple 을 가져와서 LLM 답변을 망쳤음 (V=73 → H=64).
+# 해결: vector top-K 본문에 *명시적으로 등장* 하는 entity 만 graph 시작점으로
+# 사용하고, 1-hop 결과 중 *양쪽 endpoint 가 모두 본문에 등장* 하는 triple
+# 만 keep. 이러면 graph 가 "본문 안에서 발견된 entity 들의 명시적 관계"
+# 만 표면화 — 노이즈 0 보장.
+
+# 모든 graph 노드 이름 캐시 (1번만 빌드).
+_GRAPH_NODE_NAMES = None
+
+
+def _get_all_graph_node_names() -> list[str]:
+    global _GRAPH_NODE_NAMES
+    if _GRAPH_NODE_NAMES is None:
+        driver = get_neo4j_driver()
+        names = []
+        try:
+            with driver.session() as s:
+                rows = s.run(
+                    "MATCH (n) WHERE NOT n:Document AND coalesce(n.name,'') <> '' "
+                    "RETURN n.name AS name"
+                ).data()
+                names = [(r["name"] or "").strip() for r in rows if r["name"]]
+        finally:
+            driver.close()
+        # 길이 ≥ 2 만 (1글자 false-positive 회피)
+        _GRAPH_NODE_NAMES = sorted({n for n in names if len(n) >= 2}, key=lambda x: -len(x))
+    return _GRAPH_NODE_NAMES
+
+
+def _entities_in_body(body_text: str) -> set[str]:
+    """본문 텍스트에서 graph 노드 이름이 substring 으로 등장하는 것만 추출.
+    긴 entity 우선 매칭 (한국어 행정 도메인의 합성어 매칭에 유리)."""
+    if not body_text:
+        return set()
+    found = set()
+    for name in _get_all_graph_node_names():
+        if name in body_text:
+            found.add(name)
+    return found
+
+
+def vector_anchored_graph_search(
+    query, vector_docs, max_relations: int = 5,
+) -> list[dict]:
+    """진짜 vector-anchored — vector 본문에 등장한 entity 만 graph 시작점으로,
+    1-hop 결과 중 양쪽 endpoint 모두 본문에 등장한 triple 만 surface.
+
+    Phase 8/9b 의 노이즈 ("query embedding 으로 graph node 잡는 방식이 본문과
+    disconnect") 를 완전 제거. graph 가 본문에 없는 정보를 끌어올 수 없음.
+    """
+    if not vector_docs:
+        return []
+    body = "\n".join((d.get("content") or "") for d in vector_docs)
+    body_entities = _entities_in_body(body)
+    if len(body_entities) < 2:
+        # entity 1개 이하면 의미있는 관계 형성 불가
+        return []
+
+    driver = get_neo4j_driver()
+    seen = {}
+    try:
+        with driver.session() as s:
+            rows = s.run("""
+                MATCH (a)-[r]->(b)
+                WHERE NOT a:Document AND NOT b:Document
+                  AND coalesce(a.name,'') IN $names
+                  AND coalesce(b.name,'') IN $names
+                  AND type(r) IN $types
+                RETURN a.name AS f, type(r) AS rel, b.name AS t
+            """, {
+                "names": list(body_entities),
+                "types": MEANINGFUL_RELATIONS,
+            }).data()
+        for row in rows:
+            f, rel, t = row["f"].strip(), row["rel"].strip(), row["t"].strip()
+            if not f or not t or not rel or f == t:
+                continue
+            score = RELATION_TYPE_WEIGHT.get(rel, 1.0)
+            key = (f, rel, t)
+            if key not in seen or seen[key]["score"] < score:
+                seen[key] = {"from": f, "relation": rel, "to": t, "score": score}
+    finally:
+        driver.close()
+
+    out = sorted(seen.values(), key=lambda x: -x["score"])
+    return [{"from": t["from"], "relation": t["relation"], "to": t["to"]}
+            for t in out[:max_relations]]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -939,6 +1044,67 @@ GENERATION_TEMPERATURE = 0.2     # 논문 기록용 (낮은 값으로 결정성/
 GENERATION_MAX_TOKENS = None     # None=모델 기본값. Phase 2 ablation 결과 cap=400 이
                                  # vector(-5) hybrid(-6) 모두 떨어뜨림 → 무제한 복귀.
 
+# Chain-of-Verification (Phase 11) toggle.
+# Anchored mode 가 -4 까지 좁혔으나 H>V 못 만듦 (graph 의 marginal value=0).
+# CoV: vector 답변 생성 → graph triple 로 LLM 검증/보강 → final answer.
+# 출처: Dhuliawala et al. 2023 "Chain-of-Verification Reduces Hallucination"
+USE_VERIFICATION = os.getenv("USE_VERIFICATION", "0") == "1"
+VERIFICATION_MODEL = "solar-pro3"
+
+
+def verify_and_refine(query: str, draft_answer: str,
+                      vector_docs: list, graph_relations: list) -> str:
+    """vector 답변 (draft) + graph triple 보고 LLM 이 검증/보강 → final.
+    graph 단서가 draft 에 빠진 정답 사실 (특히 조건/예외/임계값) 알려주거나,
+    draft 의 모순 fact 을 본문 기반으로 교정."""
+    if not graph_relations:
+        return draft_answer  # graph 없으면 검증 단계 스킵
+
+    triples_text = "\n".join(
+        f"- {r['from']} --[{r['relation']}]--> {r['to']}"
+        for r in graph_relations[:10]
+    )
+    body_text = "\n".join(
+        f"[{i+1}] {(d.get('content') or '')[:600]}"
+        for i, d in enumerate(vector_docs[:5])
+    )
+
+    prompt = f"""당신은 답변 검증 전문가입니다. 아래 *초안 답변* 을 *문서 본문* 과
+*지식그래프 단서* 에 비추어 검토하고, 필요시 보강하거나 교정한 *최종 답변* 을
+출력하세요.
+
+[질문]
+{query}
+
+[초안 답변]
+{draft_answer}
+
+[문서 본문]
+{body_text}
+
+[지식그래프 단서 (조건/관계 보조)]
+{triples_text}
+
+[검증 규칙]
+1. 초안에 사실 오류가 있으면 본문 기반으로 교정.
+2. 본문에 명시된 핵심 사실 (수치/날짜/예외/면제) 이 초안에 빠졌으면 추가.
+3. 그래프 단서가 본문에 명시된 관계 (예: 자격/대체/예외) 라면 답변에 명시.
+4. 그래프 단서가 본문에 없거나 모순되면 무시 (본문 우선).
+5. 초안이 이미 정확하고 완전하면 그대로 출력 (불필요한 변형 금지).
+
+[최종 답변]
+"""
+    try:
+        r = upstage_client.chat.completions.create(
+            model=VERIFICATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=GENERATION_TEMPERATURE,
+        )
+        refined = (r.choices[0].message.content or "").strip()
+        return refined if refined else draft_answer
+    except Exception:
+        return draft_answer
+
 
 def generate_answer(query, context, model=GENERATION_MODEL):
     """컨텍스트 기반 LLM 답변 생성. 모델/온도/max_tokens 는 모듈 상수 참조."""
@@ -947,11 +1113,13 @@ def generate_answer(query, context, model=GENERATION_MODEL):
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
 
 아래 검색 결과를 바탕으로 질문에 답변하세요. 검색 결과는 두 가지로 구성됩니다:
-- [핵심 관계/조건 단서]: 지식 그래프에서 추출한 개체 간 조건·자격·대상·요구사항 관계. **조건 판정형 질문(자격/요건/대상/기한 등)에서 결정적 근거**로 사용하세요. 본문에 명시 안 된 조건이나 관계도 단서가 일치하면 답변에 반영하세요.
-- [문서 본문]: 공지/문서의 실제 서술. **배경 설명·구체 수치·인용**의 근거로 사용하세요.
+- [핵심 관계/조건 단서]: 지식 그래프에서 추출한 개체 간 관계 — 본문 검증/보강 *보조 자료*. 본문에 같은 정보가 있으면 본문 표현 사용. 본문에 없거나 불충분한 부분만 단서로 보강.
+- [문서 본문]: 공지/문서의 실제 서술. **답변의 1차 근거** — 사실, 수치, 자격, 조건, 예외, 면제 모두 본문 우선.
 
-두 정보가 충돌할 경우: 사실(날짜·금액·수치)은 본문이 우선, 자격/대상/조건 관계는 단서가 우선.
-반드시 검색 결과에 근거해서만 답변하세요. 검색 결과에 없는 내용은 추측하지 말고 "해당 정보를 찾을 수 없습니다."라고 답변하세요.
+답변 규칙:
+1. **본문 우선** — 단서와 본문이 충돌하면 본문 채택. 단서만 있고 본문에 없으면 단서로 답하기 전 정말 질문과 일치하는지 다시 확인.
+2. 검색 결과에 없는 내용은 추측 금지 — "해당 정보를 찾을 수 없습니다." 답변.
+3. 본문에 "면제", "예외", "단", "다만" 같은 한정/예외 조항이 있으면 절대 누락 금지.
 
 [검색 결과]
 {context}
@@ -978,66 +1146,156 @@ def generate_answer(query, context, model=GENERATION_MODEL):
     return response.choices[0].message.content.strip()
 
 
+# Graph 활용 모드 — env GRAPH_USAGE={anchored|context|expansion|off}
+# anchored (Phase 10, 신규 default): vector_anchored_graph_search 사용.
+#   Vector 본문에 등장한 entity 만 graph 시작점, 양쪽 endpoint 본문에
+#   등장한 triple 만 surface → 노이즈 0. LLM context 에 주입.
+# context (legacy): query embedding seed graph_search → triple 을 LLM 주입
+#   (Phase 8 결과 -9 regression — anti-pattern in admin docs)
+# expansion: graph entity 로 query 확장 → vector 재검색 (Phase 9b 결과 -9)
+# off: graph 완전 비활성 (= vector_only_rag 와 동일)
+GRAPH_USAGE = os.getenv("GRAPH_USAGE", "anchored")
+
+
+def _graph_to_query_expansion(graph_data: list, max_entities: int = 5) -> str:
+    """Graph triple/path 에서 핵심 entity 추출 → query 확장 토큰.
+    중복 제거, 등장 빈도 ↑ entity 우선."""
+    if not graph_data:
+        return ""
+    is_path = isinstance(graph_data[0], dict) and "nodes" in graph_data[0]
+    entity_count = defaultdict(int)
+    if is_path:
+        for p in graph_data:
+            for n in (p.get("nodes") or []):
+                if n and len(n) >= 2:
+                    entity_count[n.strip()] += 1
+    else:
+        for t in graph_data:
+            for k in ("from", "to"):
+                v = (t.get(k) or "").strip()
+                if v and len(v) >= 2:
+                    entity_count[v] += 1
+    top = sorted(entity_count.items(), key=lambda x: -x[1])[:max_entities]
+    return " ".join(e for e, _ in top)
+
+
 # ── Hybrid RAG 메인 ───────────────────────────────────────
 def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
-    """Hybrid RAG 파이프라인 실행"""
+    """Hybrid RAG 파이프라인.
+
+    GRAPH_USAGE=expansion (기본, Phase 8 분석 결과):
+      1. graph_search 로 entity 추출
+      2. query + entity 로 vector 재검색 (확장 검색)
+      3. LLM context = vector 본문만 (graph triple 미주입)
+    GRAPH_USAGE=context (legacy):
+      LLM prompt 에 graph triple 직접 포함 — 한국 행정 도메인엔 anti-pattern
+    GRAPH_USAGE=off:
+      graph 완전 무시 → vector-only 와 동일 (sanity check 용)
+    """
     if verbose:
         print(f"\n{'=' * 60}")
         print(f"[Hybrid RAG] 질문: {query}")
+        print(f"  GRAPH_USAGE={GRAPH_USAGE}")
         print("=" * 60)
 
     vector_docs = []
     graph_relations = []
+    graph_data = []
 
+    # 1차: 원 query 로 vector + graph 검색
     if use_vector:
         try:
             vector_docs = vector_search(query, n_results=5)
-            if verbose:
-                print(f"\n[Vector 검색] {len(vector_docs)}개 문서 검색됨")
-                for doc in vector_docs:
-                    print(f"  - {doc['source']} (유사도: {doc['score']})")
         except Exception as e:
             if verbose:
                 print(f"\n[Vector 검색 오류] {e}")
             vector_docs = []
 
-    graph_data = []
-    if use_graph:
+    if use_graph and GRAPH_USAGE != "off":
         try:
-            if USE_GRAPH_SEARCH_V3:
-                # SOTA 합성: LightRAG dual + doc-restricted 2-hop + PathRAG flow + CRAG
+            if GRAPH_USAGE == "anchored":
+                # Phase 13: graph anchor 용 vector_docs 분리 옵션
+                # USE_RERANK=0 (vector raw) + RERANK_FOR_GRAPH_ANCHOR=1 →
+                # graph 시작점은 rerank 거친 chunks 사용 (topically cleaner)
+                if (not USE_RERANK) and RERANK_FOR_GRAPH_ANCHOR and vector_docs:
+                    try:
+                        # 다시 top-10 가져와서 rerank → top-5 (graph anchor 전용)
+                        anchor_candidates = _raw_vector_search(query, n_results=RETRIEVE_K)
+                        anchor_docs = llm_rerank(query, anchor_candidates, top_k=RERANK_TO_K)
+                    except Exception:
+                        anchor_docs = vector_docs
+                else:
+                    anchor_docs = vector_docs
+                # Phase 10b: max_relations 5→3 (graph 신호 더 압축)
+                graph_relations = vector_anchored_graph_search(
+                    query, anchor_docs, max_relations=3,
+                )
+                graph_data = graph_relations
+            elif USE_GRAPH_SEARCH_V3:
                 graph_data = graph_search_v3(query, vector_docs=vector_docs)
                 graph_relations = paths_to_edges(graph_data)
             else:
                 graph_relations = graph_search(query, vector_docs=vector_docs)
                 graph_data = graph_relations
-
-            # Phase 5: graph noise gating — body 와 무관한 triple drop
             if USE_GRAPH_GATING and vector_docs:
-                pre_count = len(graph_data)
                 graph_data = gate_graph_by_body(graph_data, vector_docs)
                 graph_relations = (
                     paths_to_edges(graph_data) if USE_GRAPH_SEARCH_V3 else graph_data
                 )
-                if verbose and pre_count != len(graph_data):
-                    print(f"\n[Graph gating] {pre_count} → {len(graph_data)} (본문 정합성 검증)")
-
-            if verbose:
-                print(f"\n[Graph 검색] 최종 {len(graph_relations)}개 관계")
-                for rel in (graph_relations[:5] if not USE_GRAPH_SEARCH_V3 else []):
-                    print(f"  - {rel['from']} --[{rel['relation']}]--> {rel['to']}")
-                for p in (graph_data[:5] if USE_GRAPH_SEARCH_V3 else []):
-                    line = _path_to_korean(p)
-                    if line:
-                        print(f"  {line}  (rel={p.get('reliability', 0):.3f})")
         except Exception as e:
             if verbose:
                 print(f"\n[Graph 검색 오류] {e}")
             graph_data = []
             graph_relations = []
 
-    context = merge_results(vector_docs, graph_data)
-    answer = generate_answer(query, context, model=GENERATION_MODEL)
+    # GRAPH_USAGE=expansion: graph entity 로 query 확장 후 vector 재검색
+    expansion_used = False
+    if GRAPH_USAGE == "expansion" and graph_data and use_vector:
+        expansion = _graph_to_query_expansion(graph_data, max_entities=5)
+        if expansion:
+            try:
+                expanded_q = f"{query}\n관련 키워드: {expansion}"
+                expanded_docs = vector_search(expanded_q, n_results=5)
+                # 원 검색 + 확장 검색 dedup 후 top-5 (확장 결과에 가중)
+                seen = set()
+                merged = []
+                for d in expanded_docs + vector_docs:
+                    key = (d.get("source", ""), (d.get("content", "") or "")[:80])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(d)
+                    if len(merged) >= 5:
+                        break
+                vector_docs = merged
+                expansion_used = True
+                if verbose:
+                    print(f"\n[Graph expansion] {expansion[:80]}")
+            except Exception as e:
+                if verbose:
+                    print(f"\n[Graph expansion 오류] {e}")
+
+    if verbose:
+        print(f"\n[Vector 검색] {len(vector_docs)}개 문서")
+        for doc in vector_docs:
+            print(f"  - {doc.get('source','')} (유사도: {doc.get('score')})")
+        print(f"\n[Graph] {len(graph_relations)}개 관계, expansion_used={expansion_used}")
+
+    # GRAPH_USAGE=context|anchored 일 때 graph 를 LLM prompt 에 포함.
+    # expansion 은 vector retrieval 만 보강 → LLM context 엔 vector 본문만.
+    # off 면 graph 자체가 빈 상태.
+    # USE_VERIFICATION=1 일 땐 vector-only context 로 draft 만든 후 graph 로 refine.
+    if USE_VERIFICATION:
+        # Phase 11: Chain-of-Verification — graph 는 검증 단계에만
+        context = merge_results(vector_docs, [])  # draft 는 vector 만
+        draft = generate_answer(query, context, model=GENERATION_MODEL)
+        answer = verify_and_refine(query, draft, vector_docs, graph_relations)
+    else:
+        if GRAPH_USAGE in ("context", "anchored"):
+            context = merge_results(vector_docs, graph_data)
+        else:
+            context = merge_results(vector_docs, [])
+        answer = generate_answer(query, context, model=GENERATION_MODEL)
 
     if verbose:
         print(f"\n[최종 답변]\n{answer}")
@@ -1048,7 +1306,9 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
         "graph_relations": graph_relations,
         "graph_paths": graph_data if USE_GRAPH_SEARCH_V3 else [],
         "context": context,
-        "answer": answer
+        "answer": answer,
+        "graph_usage": GRAPH_USAGE,
+        "expansion_used": expansion_used,
     }
 
 
