@@ -1,10 +1,11 @@
 requests==2.31.0
 beautifulsoup4==4.12.3
-opendataloader-pdf==2.4.1
+opendataloader-pdf==1.0.0
 pyhwp==0.1b15
 
 chromadb==0.6.3
-openai==1.40.0   # Upstage 호출 패턴이 OpenAI SDK 호환 (base_url=upstage)
+openai==1.40.0
+httpx<0.28
 
 neo4j==5.23.1
 

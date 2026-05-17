@@ -28,12 +28,12 @@ def _get_eval_metadata() -> dict:
     값이 바뀌면 여기 직접 갱신 (런타임 동적 import 보다 단순/명시적이 낫다)."""
     return {
         "Generation 모델":  "solar-pro3",
-        "Generation temp":  "0.2",
-        "Judge 모델":       f"{os.getenv('EVAL_JUDGE_MODEL', 'solar-pro2')} (temp=0)",
+        "Generation temp":  "0",
+        "Judge 모델":       f"{os.getenv('EVAL_JUDGE_MODEL', 'solar-pro3')} (temp=0)",
         "Embedding 모델":   "embedding-passage",
         "chunk_size":       "500 (실측)",
-        "max_relations":    "5",
-        "n_results":        "3",
+        "max_relations":    "3",
+        "n_results":        "5",
         "git hash":         _get_git_hash(),
     }
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -113,13 +113,13 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
     ws1.cell(row=metrics_header_row, column=1).alignment = AL_C
     ws1.row_dimensions[metrics_header_row].height = 22
 
-    # 새 컬럼 인덱스 (1-based): E=Vector 정답, I=Hybrid 정답, L=Graph 수
+    # 새 컬럼 인덱스 (1-based): F=Vector 정답, J=Hybrid 정답, M=Graph 수
     metrics = [
-        ("Vector 정답 수",    f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")"),
-        ("Vector 정답률",     f"=COUNTIF('② 결과'!E2:E{n+1},\"정답\")/COUNTA('② 결과'!E2:E{n+1})"),
-        ("Hybrid 정답 수",    f"=COUNTIF('② 결과'!I2:I{n+1},\"정답\")"),
-        ("Hybrid 정답률",     f"=COUNTIF('② 결과'!I2:I{n+1},\"정답\")/COUNTA('② 결과'!I2:I{n+1})"),
-        ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!L2:L{n+1})"),
+        ("Vector 정답 수",    f"=COUNTIF('② 결과'!F2:F{n+1},\"정답\")"),
+        ("Vector 정답률",     f"=COUNTIF('② 결과'!F2:F{n+1},\"정답\")/COUNTA('② 결과'!F2:F{n+1})"),
+        ("Hybrid 정답 수",    f"=COUNTIF('② 결과'!J2:J{n+1},\"정답\")"),
+        ("Hybrid 정답률",     f"=COUNTIF('② 결과'!J2:J{n+1},\"정답\")/COUNTA('② 결과'!J2:J{n+1})"),
+        ("평균 Graph 관계 수", f"=AVERAGE('② 결과'!M2:M{n+1})"),
     ]
     for i, (label, formula) in enumerate(metrics, start=metrics_start_row):
         lc = ws1.cell(row=i, column=1, value=label)
@@ -147,13 +147,13 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
     ws2 = wb.create_sheet("② 결과")
 
     headers = [
-        "번호", "분류", "질문", "정답",
+        "No", "번호", "분류", "질문", "정답",
         "Vector 정답", "Vector 답변", "Vector 사유", "Vector 오류",
         "Hybrid 정답", "Hybrid 답변", "Hybrid 사유", "Graph 수", "Hybrid 오류",
     ]
-    col_widths = [6, 10, 42, 32, 10, 42, 30, 20, 10, 42, 30, 8, 20]
-    SUCCESS_COLS = {5, 9}   # Vector 정답, Hybrid 정답 (1-based)
-    GRAPH_COL = 12           # Graph 수 컬럼 인덱스
+    col_widths = [5, 6, 10, 42, 32, 10, 42, 30, 20, 10, 42, 30, 8, 20]
+    SUCCESS_COLS = {6, 10}  # Vector 정답, Hybrid 정답 (1-based)
+    GRAPH_COL = 13           # Graph 수 컬럼 인덱스
 
     # 헤더
     for col_idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
@@ -171,6 +171,7 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
         h_str = "정답" if r.get("hybrid_success") is True else "오답"
 
         data = [
+            r.get("no", ""),
             r.get("id", ""),
             r.get("category", ""),
             r.get("question", ""),
@@ -193,7 +194,7 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
             if col_idx in SUCCESS_COLS:
                 cell.fill      = SUCCESS_FILL if val == "정답" else FAIL_FILL
                 cell.alignment = AL_TC
-            elif col_idx == 3:  # 질문 열 배경
+            elif col_idx == 4:  # 질문 열 배경
                 cell.fill      = Q_FILL
                 cell.alignment = AL_TL
             elif col_idx == GRAPH_COL:  # Graph 수
@@ -203,7 +204,7 @@ def _save_clean_xlsx(xlsx_path, rows, collection_name, experiment_id, elapsed, t
 
         ws2.row_dimensions[idx].height = 15
 
-    ws2.freeze_panes = "E2"  # 질문까지 고정, 성공/실패부터 스크롤
+    ws2.freeze_panes = "F2"  # No·번호·분류·질문까지 고정, 성공/실패부터 스크롤
 
     # ── ③ 세부지표 시트 (논문 분석용 raw fields + 계산 metric) ──────────
     _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
@@ -241,6 +242,7 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
 
     # 컬럼 헤더 + 너비 정의 (paper raw analysis 용)
     columns = [
+        ("No", 5),
         ("번호", 6),
         ("분류", 12),
         ("페르소나", 18),
@@ -274,7 +276,7 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
     ]
     headers = [c[0] for c in columns]
     widths = [c[1] for c in columns]
-    SUCCESS_COLS_DETAIL = {8, 18}  # V_정답여부, H_정답여부 (1-based)
+    SUCCESS_COLS_DETAIL = {9, 19}  # V_정답여부, H_정답여부 (1-based)
 
     from openpyxl.utils import get_column_letter
     for i, (h, w) in enumerate(zip(headers, widths), start=1):
@@ -294,6 +296,7 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
         h_src_count = len([s for s in h_sources_str.split(" | ") if s.strip()])
 
         data = [
+            r.get("no", ""),
             r.get("id", ""),
             r.get("category", ""),
             persona_by_id.get(str(r.get("id", "")), ""),
@@ -335,14 +338,14 @@ def _add_detail_sheet(wb, rows, H_FONT, B_FONT, N_FONT, AL_C, AL_TL, AL_TC,
             if col_idx in SUCCESS_COLS_DETAIL:
                 cell.fill = SUCCESS_FILL if safe_val == "정답" else FAIL_FILL
                 cell.alignment = AL_TC
-            elif col_idx == 4:  # 질문 배경
+            elif col_idx == 5:  # 질문 배경
                 cell.fill = Q_FILL
                 cell.alignment = AL_TL
             else:
                 cell.alignment = AL_TL
         ws.row_dimensions[idx].height = 15
 
-    ws.freeze_panes = "F2"  # 정답까지 고정
+    ws.freeze_panes = "G2"  # No·번호·분류·페르소나·질문까지 고정
 
 
 # ── 경로 설정 ─────────────────────────────────────────────
@@ -457,7 +460,7 @@ def truncate_text(text, limit=1500):
 
 
 # ── LLM-as-judge: 답변 정답 여부 채점 ─────────────────────
-JUDGE_MODEL = "solar-pro2"  # 재현성을 위해 generation 과 다른 dated 모델 고정
+JUDGE_MODEL = "solar-pro3"  # generation 모델과 동급 이상이어야 판정 신뢰도 확보
 JUDGE_TEMPERATURE = 0
 JUDGE_BASE_URL = "https://api.upstage.ai/v1"
 
@@ -482,12 +485,30 @@ def judge_answer(question, ground_truth, predicted, judge_llm):
         return "skipped", "정답(ground_truth) 미제공"
 
     prompt = (
-        "아래 RAG 챗봇 답변이 정답과 의미상 일치하는지 판단하세요.\n"
-        "사소한 표현 차이는 일치로 보고, 핵심 사실(날짜/금액/조건/대상/링크 등)이 "
-        "다르거나 누락되면 불일치로 판단하세요.\n\n"
+        "아래 RAG 챗봇 답변이 정답과 의미상 일치하는지 판단하세요.\n\n"
+        "## 판정 기준\n"
+        "correct  : 정답의 핵심 사실이 답변에 모두 포함되어 있고 정확함.\n"
+        "           정답보다 더 상세하거나 추가 정보가 있어도 핵심이 맞으면 correct.\n"
+        "incorrect: 정답의 핵심 사실 중 하나라도 (1) 틀린 값으로 기재되거나 (2) 완전히 누락됨.\n"
+        "           또는 질문 대상과 다른 항목·프로그램의 값을 핵심 답변으로 제시한 경우.\n\n"
+        "## 수치 판정 (엄격 적용)\n"
+        "- 점수·학점·금액·기간 등 수치는 정답과 정확히 일치해야 correct.\n"
+        "- 그럴듯하지만 다른 수치(예: 정답 83점 → 답변 94점, 정답 2억 → 답변 3억)는 incorrect.\n"
+        "- 답변이 아무리 길고 논리적으로 보여도 핵심 수치가 하나라도 틀리면 incorrect.\n"
+        "- 정답과 다른 프로그램·제도·트랙에서 가져온 수치를 핵심 답변으로 제시한 경우 incorrect.\n\n"
+        "## verbosity 편향 방지 (필수)\n"
+        "- 답변 길이·설명 분량·근거 나열 방식은 판정에 절대 영향 없음.\n"
+        "- 짧고 직접적인 답변과 길고 상세한 답변을 반드시 동일 기준으로 판정.\n"
+        "- 답변이 길고 자세해도 핵심 수치나 사실이 틀리면 incorrect.\n"
+        "- 답변이 짧아도 핵심 사실이 맞으면 correct.\n\n"
+        "## 추가 정보 처리\n"
+        "- 추가 정보(정답에 없지만 사실에 부합하는 내용)만으로는 incorrect 판정 금지.\n"
+        "- 사소한 표현·어순 차이는 correct.\n\n"
         f"질문: {question}\n"
         f"정답: {ground_truth}\n"
         f"답변: {predicted}\n\n"
+        "판정 순서: ① 정답의 핵심 수치·사실을 먼저 확인 → ② 답변에서 해당 수치·사실 대조 "
+        "→ ③ 하나라도 틀리거나 누락되면 incorrect, 모두 맞으면 correct.\n\n"
         "다음 JSON 한 줄로만 답하세요:\n"
         '{"verdict": "correct" 또는 "incorrect", "reason": "한 문장"}'
     )
@@ -622,6 +643,53 @@ def evaluate_one(module, item, index, judge_llm=None):
     return row
 
 
+# ── 평가 범위 입력 ────────────────────────────────────────
+def _prompt_eval_range(total: int):
+    """사용자로부터 평가 범위를 입력받아 (start_idx, end_idx) 0-based 슬라이스 인덱스 반환."""
+    print()
+    print("=" * 58)
+    print(f"  평가 범위 선택  (QA 데이터셋 총 {total}개 항목)")
+    print("=" * 58)
+    print("  입력 형식:")
+    print(f"    0      전체 평가 (1~{total}번, {total}개 모두)")
+    print(f"    N      N번 항목 1개만        예) 5")
+    print(f"    N,M    N번~M번 범위 평가     예) 1,50  →  1~50번")
+    print(f"    N,     N번부터 끝까지        예) 51,   →  51~{total}번")
+    print(f"    ,M     처음부터 M번까지      예) ,30   →  1~30번")
+    print("=" * 58)
+
+    while True:
+        raw = input("  입력 > ").strip()
+        if not raw:
+            print("  [오류] 값을 입력하세요.")
+            continue
+
+        try:
+            if raw == "0":
+                print(f"  → 전체 {total}개 항목을 평가합니다.\n")
+                return 0, total
+
+            if "," in raw:
+                left, right = raw.split(",", 1)
+                left, right = left.strip(), right.strip()
+                start = (int(left) - 1) if left else 0
+                end   = int(right) if right else total
+            else:
+                n = int(raw)
+                start, end = n - 1, n
+
+            if start < 0 or end > total or start >= end:
+                print(f"  [오류] 1~{total} 범위 내에서 start < end 가 되도록 지정하세요.")
+                continue
+
+            count = end - start
+            print(f"  → {start + 1}번~{end}번 항목을 평가합니다. ({count}개)\n")
+            return start, end
+
+        except ValueError:
+            print("  [오류] 숫자 또는 'N,M' 형식으로 입력하세요.")
+
+
 # ── 전체 평가 ─────────────────────────────────────────────
 def run_evaluation():
     print("[시작] QA 데이터셋 평가")
@@ -648,52 +716,65 @@ def run_evaluation():
     print(f" - 실험 ID: {experiment_id}")
     print(f" - 총 질문 수: {len(dataset)}개")
 
+    start_idx, end_idx = _prompt_eval_range(len(dataset))
+    eval_subset = dataset[start_idx:end_idx]
+    print(f" - 평가 범위: {start_idx + 1}~{end_idx}번 ({len(eval_subset)}개)")
+
     rows = []
     start_time = time.time()
 
-    for idx, item in enumerate(dataset):
-        question = extract_question(item)
-        print(f"\n[{idx + 1}/{len(dataset)}] {question[:80]}")
-        try:
-            row = evaluate_one(module, item, idx, judge_llm)
-        except Exception as e:
-            row = {
-                "id": extract_id(item, idx),
-                "category": extract_category(item),
-                "question": question,
-                "ground_truth": extract_ground_truth(item),
+    try:
+        for local_idx, item in enumerate(eval_subset):
+            idx = start_idx + local_idx
+            question = extract_question(item)
+            print(f"\n[{local_idx + 1}/{len(eval_subset)}] #{idx + 1} {question[:80]}")
+            try:
+                row = evaluate_one(module, item, idx, judge_llm)
+            except Exception as e:
+                row = {
+                    "id": extract_id(item, idx),
+                    "category": extract_category(item),
+                    "question": question,
+                    "ground_truth": extract_ground_truth(item),
 
-                "vector_success": False,
-                "vector_judge_verdict": "error",
-                "vector_judge_reason": "평가 핸들러 오류",
-                "vector_answer": "",
-                "vector_sources": "",
-                "vector_scored_sources": "",
-                "vector_context_preview": "",
-                "vector_error": f"Unhandled: {type(e).__name__}: {e}",
+                    "vector_success": False,
+                    "vector_judge_verdict": "error",
+                    "vector_judge_reason": "평가 핸들러 오류",
+                    "vector_answer": "",
+                    "vector_sources": "",
+                    "vector_scored_sources": "",
+                    "vector_context_preview": "",
+                    "vector_error": f"Unhandled: {type(e).__name__}: {e}",
 
-                "hybrid_success": False,
-                "hybrid_judge_verdict": "error",
-                "hybrid_judge_reason": "평가 핸들러 오류",
-                "hybrid_answer": "",
-                "hybrid_sources": "",
-                "hybrid_scored_sources": "",
-                "hybrid_graph_count": 0,
-                "hybrid_graph_preview": "",
-                "hybrid_context_preview": "",
-                "hybrid_error": f"Unhandled: {type(e).__name__}: {e}",
-            }
+                    "hybrid_success": False,
+                    "hybrid_judge_verdict": "error",
+                    "hybrid_judge_reason": "평가 핸들러 오류",
+                    "hybrid_answer": "",
+                    "hybrid_sources": "",
+                    "hybrid_scored_sources": "",
+                    "hybrid_graph_count": 0,
+                    "hybrid_graph_preview": "",
+                    "hybrid_context_preview": "",
+                    "hybrid_error": f"Unhandled: {type(e).__name__}: {e}",
+                }
 
-        v_label = "정답" if row["vector_success"] else f"오답({row.get('vector_judge_verdict', '?')})"
-        h_label = "정답" if row["hybrid_success"] else f"오답({row.get('hybrid_judge_verdict', '?')})"
-        print(
-            f"  - Vector: {v_label}"
-            f" | Hybrid: {h_label}"
-            f" | Graph relations: {row['hybrid_graph_count']}"
-        )
-        rows.append(row)
+            row["no"] = f"{local_idx + 1:02d}"
+            v_label = "정답" if row["vector_success"] else f"오답({row.get('vector_judge_verdict', '?')})"
+            h_label = "정답" if row["hybrid_success"] else f"오답({row.get('hybrid_judge_verdict', '?')})"
+            print(
+                f"  - Vector: {v_label}"
+                f" | Hybrid: {h_label}"
+                f" | Graph relations: {row['hybrid_graph_count']}"
+            )
+            rows.append(row)
+    except KeyboardInterrupt:
+        print(f"\n\n[중단] Ctrl+C 감지 — {len(rows)}/{len(eval_subset)}개 완료. 결과 저장 중...")
 
     elapsed = round(time.time() - start_time, 2)
+
+    if not rows:
+        print("[종료] 저장할 결과 없음")
+        return {}
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_path = os.path.join(RESULTS_DIR, f"evaluation_results_{timestamp}.xlsx")

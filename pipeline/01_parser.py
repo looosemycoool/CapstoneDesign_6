@@ -52,6 +52,158 @@ def find_libreoffice():
 LIBREOFFICE = find_libreoffice()
 
 
+# ── 트랙별 졸업요건 표 어노테이션 ─────────────────────────────
+# opendataloader가 PDF 표를 선형화하면 다중전공트랙/해외복수학위트랙/학석사연계트랙의
+# 요건이 한 텍스트에 뒤섞인다. 각 ▸ 항목 앞에 [트랙명]을 삽입해
+# LLM이 어느 트랙의 요건인지 구분할 수 있도록 한다.
+
+_GRAD_TRACKS = [
+    "다중전공트랙",
+    "해외복수학위트랙",
+    "학석사연계트랙",
+    "학·석사연계트랙",
+    "학・석사연계트랙",
+]
+_TRACK_CANONICAL = {
+    "학·석사연계트랙":  "학석사연계트랙",
+    "학・석사연계트랙": "학석사연계트랙",
+}
+
+
+def _annotate_track_sections(text: str) -> str:
+    """PDF 표 선형화로 혼재된 트랙별 졸업요건에 '[트랙명]' 접두어 삽입.
+
+    알고리즘:
+      1. 트랙명 등장 줄 위치를 수집한다.
+      2. 줄 → 트랙 매핑: 트랙명 이후는 forward fill,
+         첫 트랙 등장 이전 줄은 첫 트랙으로 소급 적용한다.
+      3. '▸'가 포함된 줄에 트랙 레이블이 없으면 '[트랙명]'을 앞에 붙인다.
+
+    트랙명이 없는 문서는 원문 그대로 반환(no-op).
+    """
+    if not any(t in text for t in _GRAD_TRACKS):
+        return text
+
+    def canonical(name: str) -> str:
+        return _TRACK_CANONICAL.get(name, name)
+
+    lines = text.split('\n')
+
+    # 1단계: (줄 번호, 정규 트랙명) 수집
+    track_at: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        for t in _GRAD_TRACKS:
+            if t in line:
+                track_at.append((i, canonical(t)))
+                break
+
+    if not track_at:
+        return text
+
+    # 2단계: 줄 → 담당 트랙 매핑
+    #   첫 트랙 등장 이전 줄은 첫 트랙으로 소급 (표 앞부분 요건도 첫 트랙 소속)
+    first_line, first_track = track_at[0]
+    line_track: dict[int, str] = {}
+    for i in range(first_line):
+        line_track[i] = first_track
+    current, ptr = first_track, 0
+    for i in range(first_line, len(lines)):
+        if ptr < len(track_at) and i == track_at[ptr][0]:
+            current = track_at[ptr][1]
+            ptr += 1
+        line_track[i] = current
+
+    # 3단계: ▸ 항목에 레이블 삽입
+    result = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if '▸' in stripped:
+            track = line_track.get(i)
+            if track and track not in stripped:
+                line = f"[{track}] {stripped}"
+        result.append(line)
+
+    return '\n'.join(result)
+
+
+def _annotate_markdown_table_rows(text: str) -> str:
+    """Markdown pipe 표의 각 데이터 행에 컬럼 헤더를 붙여 자기완결적으로 만든다.
+
+    청킹 시 헤더 행이 분리되어도 각 데이터 행이 의미를 보존하도록
+    '[행레이블] 헤더1: 값1 | 헤더2: 값2 ...' 형식으로 변환한다.
+    첫 번째 컬럼이 범주형(비수치) 값이면 [레이블]로 앞에 붙이고
+    나머지는 헤더명: 값 쌍으로 나열한다.
+    구분자 행(|---|)을 기준으로 표를 감지하므로 오탐 없음.
+    헤더 행·구분자 행 원본은 유지해 keyword 검색에도 걸리도록 한다.
+    """
+    def parse_cells(line: str) -> list:
+        return [c.strip() for c in line.strip().strip('|').split('|')]
+
+    def is_separator_row(line: str) -> bool:
+        s = line.strip()
+        if not s.startswith('|'):
+            return False
+        return all(
+            set(c.strip()) <= set('-: ')
+            for c in s.strip('|').split('|')
+            if c.strip()
+        )
+
+    def is_table_row(line: str) -> bool:
+        s = line.strip()
+        return s.startswith('|') and s.count('|') >= 2
+
+    def is_label_cell(s: str) -> bool:
+        """범주형 레이블로 쓸 수 있는 셀인지 판단 (숫자·수치 단위 포함 값 제외)."""
+        if not s or s[0].isdigit():
+            return False
+        value_units = ('점', '원', '%', '학점', '이상', '이하', '회', '명', '개월', '년', '시간')
+        return not any(s.endswith(u) for u in value_units)
+
+    lines = text.split('\n')
+    result = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        # 헤더 행 바로 다음이 구분자 행이면 Markdown 표로 처리
+        if (is_table_row(line)
+                and i + 1 < len(lines)
+                and is_separator_row(lines[i + 1])):
+
+            headers = parse_cells(line)
+            result.append(line)          # 헤더 행 원본 유지
+            result.append(lines[i + 1])  # 구분자 행 유지
+            i += 2
+
+            while i < len(lines) and is_table_row(lines[i]):
+                cells = parse_cells(lines[i])
+                while len(cells) < len(headers):
+                    cells.append('')
+
+                label = cells[0] if cells else ''
+                use_label = bool(label) and is_label_cell(label)
+                start = 1 if use_label else 0
+
+                pairs = [
+                    f"{h}: {v}"
+                    for h, v in zip(headers[start:], cells[start:])
+                    if v and h
+                ]
+                if pairs:
+                    row_text = ' | '.join(pairs)
+                    annotated = f"[{label}] {row_text}" if use_label else row_text
+                    result.append(annotated)
+                else:
+                    result.append(lines[i])  # 변환 실패 시 원본 유지
+                i += 1
+        else:
+            result.append(line)
+            i += 1
+
+    return '\n'.join(result)
+
+
 def parse_pdf_batch(file_paths):
     """opendataloader_pdf로 여러 PDF를 한 번에 Markdown으로 변환.
     JVM 부팅이 호출당 ~수백ms라 배치가 필수. 반환: dict[절대경로]→markdown 텍스트.
@@ -85,12 +237,14 @@ def parse_pdf_batch(file_paths):
             return results
 
         try:
-            opendataloader_pdf.convert(
-                input_path=copied_inputs, output_dir=out_dir, format="markdown"
+            # v1.0+: run(input_path=폴더, output_folder=..., generate_markdown=True)
+            # 이전 버전 convert(input_path=리스트, ...) API는 제거됨
+            opendataloader_pdf.run(
+                input_path=in_dir,
+                output_folder=out_dir,
+                generate_markdown=True,
             )
-        except (RuntimeError, OSError, ValueError) as e:
-            # 배치 변환은 보통 환경 문제(JVM/Java 누락 등)에서 실패한다.
-            # 빈 결과를 silent 하게 저장하면 호출자가 실패 인지 못 하므로 raise.
+        except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as e:
             raise RuntimeError(
                 f"opendataloader-pdf 변환 실패 ({len(copied_inputs)}개 PDF). "
                 f"Java 11+ 설치 여부 확인 필요. 원본: {e}"
@@ -105,7 +259,10 @@ def parse_pdf_batch(file_paths):
                 continue
             try:
                 with open(os.path.join(out_dir, fname), encoding="utf-8") as f:
-                    results[orig] = f.read().strip()
+                    text = f.read().strip()
+                    text = _annotate_track_sections(text)
+                    text = _annotate_markdown_table_rows(text)
+                    results[orig] = text
             except OSError as e:
                 print(f"  [PDF md 읽기 오류] {orig}: {e}")
     return results
@@ -208,7 +365,7 @@ def parse_hwp(file_path):
 
 
 def parse_xlsx(file_path):
-    """엑셀 파일에서 텍스트 추출"""
+    """엑셀 파일에서 텍스트 추출. 각 셀에 컬럼 헤더를 붙여 청킹 후에도 의미 보존."""
     result = []
     try:
         xl = pd.ExcelFile(file_path)
@@ -216,11 +373,19 @@ def parse_xlsx(file_path):
             df = xl.parse(sheet_name).fillna("")
             result.append(f"[시트: {sheet_name}]")
             for _, row in df.iterrows():
-                row_text = " | ".join(
-                    str(v).strip() for v in row.values if str(v).strip()
-                )
-                if row_text:
-                    result.append(row_text)
+                cells = []
+                for col, val in row.items():
+                    col_str = str(col).strip()
+                    val_str = str(val).strip()
+                    if not val_str:
+                        continue
+                    # pandas unnamed 컬럼('Unnamed: N')은 헤더 없는 셀 — 값만 출력
+                    if col_str and not col_str.startswith('Unnamed:'):
+                        cells.append(f"{col_str}: {val_str}")
+                    else:
+                        cells.append(val_str)
+                if cells:
+                    result.append(" | ".join(cells))
     except Exception as e:
         print(f"  [XLSX 오류] {file_path}: {e}")
     return "\n".join(result)
@@ -235,12 +400,26 @@ def parse_docx(file_path):
             if para.text.strip():
                 result.append(para.text.strip())
         for table in doc.tables:
-            for row in table.rows:
-                row_text = " | ".join(
-                    cell.text.strip() for cell in row.cells if cell.text.strip()
-                )
-                if row_text:
-                    result.append("[표] " + row_text)
+            header_cells: list = []
+            for row_idx, row in enumerate(table.rows):
+                seen_cells: set = set()
+                cells: list = []
+                for cell in row.cells:
+                    txt = cell.text.strip()
+                    if txt and txt not in seen_cells:
+                        cells.append(txt)
+                        seen_cells.add(txt)
+                if not cells:
+                    continue
+                if row_idx == 0:
+                    header_cells = cells
+                    result.append("[표헤더] " + " | ".join(cells))
+                else:
+                    if header_cells and len(header_cells) == len(cells):
+                        parts = [f"{h}: {v}" for h, v in zip(header_cells, cells)]
+                    else:
+                        parts = cells
+                    result.append("[표] " + " | ".join(parts))
     except Exception as e:
         print(f"  [DOCX 오류] {file_path}: {e}")
     return "\n".join(result)
@@ -419,8 +598,9 @@ def parse_all():
             print(f"  완료: {len(text)}자 추출")
             parsed_count += 1
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(notices, f, ensure_ascii=False, indent=2)
+        # 공지 단위로 저장 (크래시 시 이전 공지 결과 보존)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(notices, f, ensure_ascii=False, indent=2)
 
     total_files = sum(len(n.get("attachments", [])) for n in notices)
     success = sum(

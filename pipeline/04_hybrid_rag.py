@@ -1,7 +1,13 @@
 import os
 import re
+import logging
 from collections import defaultdict
 from dotenv import load_dotenv
+
+# ChromaDB telemetry 오류 메세지 억제 — import 전에 설정해야 적용됨
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+
 import chromadb
 from chromadb.config import Settings
 from neo4j import GraphDatabase
@@ -111,12 +117,27 @@ def get_neo4j_driver():
     )
 
 
+def check_neo4j_connection() -> tuple:
+    """Neo4j 연결 테스트. 실제 쿼리를 실행해 연결 가능 여부를 확인한다.
+    반환: (ok: bool, error_message: str)
+    """
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as s:
+            s.run("RETURN 1").single()
+        driver.close()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 # ── Vector 검색 ──────────────────────────────────────────
 RERANK_MODEL = "solar-pro2"  # cross-encoder 대안 — torch 없이 LLM rerank.
 USE_RERANK = os.getenv("USE_RERANK", "1") == "1"
-USE_BM25_HYBRID = os.getenv("USE_BM25_HYBRID", "0") == "1"  # Anthropic Contextual
-RETRIEVE_K = int(os.getenv("RETRIEVE_K", "10"))  # rerank 전 1차 dense 검색량
-BM25_K = int(os.getenv("BM25_K", "10"))            # BM25 1차 검색량
+USE_BM25_HYBRID = os.getenv("USE_BM25_HYBRID", "1") == "1"  # Anthropic: +RRF → 실패율 -49%
+USE_ADJACENT_EXPANSION = os.getenv("USE_ADJACENT_EXPANSION", "1") == "1"  # 인접 청크 확장 (예외·조건 누락 보완)
+RETRIEVE_K = int(os.getenv("RETRIEVE_K", "15"))  # rerank 전 1차 dense 검색량 (↑ 후보 풀)
+BM25_K = int(os.getenv("BM25_K", "15"))           # BM25 1차 검색량
 RERANK_TO_K = int(os.getenv("RERANK_TO_K", "5"))  # rerank 후 최종
 
 # Phase 13 가설: rerank 가 vector 정확도 깎지만 (V↓6), graph anchor 의 시작점
@@ -208,15 +229,18 @@ def _raw_vector_search(query, n_results):
         n_results=n_results,
     )
     docs = []
+    ids       = results.get("ids",       [[]])[0]
     documents = results.get("documents", [[]])[0]
     metadatas = results.get("metadatas", [[]])[0]
     distances = results.get("distances", [[]])[0]
-    for doc, meta, dist in zip(documents, metadatas, distances):
+    for chunk_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
         score = round(1 - dist, 3) if dist is not None else None
         docs.append({
-            "content": doc,
-            "source": meta.get("file_name", "") if meta else "",
-            "score": score,
+            "content":  doc,
+            "source":   (meta or {}).get("file_name", ""),
+            "score":    score,
+            "chunk_id": chunk_id,                          # Graph 브리지용
+            "doc_key":  (meta or {}).get("doc_key", ""),   # Graph 브리지용
         })
     return docs
 
@@ -236,21 +260,24 @@ def llm_rerank(query: str, docs: list[dict], top_k: int = 5) -> list[dict]:
         return docs[:top_k]
 
     candidates_text = "\n".join(
-        f"[{i}] (출처: {d.get('source','')[:40]})\n{d.get('content','')[:500]}"
+        f"[{i}] (출처: {d.get('source','')[:40]})\n{d.get('content','')[:800]}"
         for i, d in enumerate(docs)
     )
-    prompt = f"""다음 후보 문서 {len(docs)}개를 질문과의 관련성 높은 순서로 정렬하세요.
+    prompt = f"""경북대학교 행정 문서에서 아래 질문에 답변하기 위해 가장 관련 있는 문서 순위를 매기세요.
 
 질문: {query}
 
-후보:
+후보 문서:
 {candidates_text}
 
-규칙:
-- 질문에 직접 답변할 수 있는 정보를 가진 문서가 상위
-- 출처 파일명도 단서 (관련 주제일 가능성)
-- 응답 형식: 가장 관련 높은 순서대로 인덱스 번호만 쉼표로 구분
-- 예: 3, 0, 5, 7, 2 (총 {len(docs)}개 모두 포함)
+순위 기준 (중요도 순):
+1. 질문에서 묻는 특정 제도·트랙·요건의 수치·조건이 직접 명시된 문서 최우선
+2. [다중전공트랙] [해외복수학위트랙] [학석사연계트랙] 같은 트랙 태그가 붙은 항목이 있으면 해당 트랙 관련 문서 우선
+3. 질문과 동일한 핵심 키워드(학점 수, 점수, 기간, 자격 조건)를 정확히 포함한 문서
+4. 출처 파일명이 질문 주제와 직접 연관된 문서
+
+응답 형식: 관련 높은 순서로 인덱스 번호만 쉼표 구분 (전체 포함)
+예: 3, 0, 5, 7, 2
 
 순위:"""
     try:
@@ -258,7 +285,7 @@ def llm_rerank(query: str, docs: list[dict], top_k: int = 5) -> list[dict]:
             model=RERANK_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=80,
+            max_tokens=150,
         )
         text = (r.choices[0].message.content or "").strip()
         # parse "3, 0, 5, ..." → 인덱스 list
@@ -498,6 +525,172 @@ def _entities_in_body(body_text: str) -> set[str]:
         if name in body_text:
             found.add(name)
     return found
+
+
+def chunk_anchored_graph_search(
+    vector_docs: list[dict],
+    max_relations: int = 5,
+    max_extra_chunks: int = 3,
+) -> tuple[list[dict], list[str]]:
+    """chunk_id 브리지 기반 그래프 검색 (Document/Chunk/Entity 3계층 구조용).
+
+    흐름:
+      1. vector_docs 의 chunk_id → Neo4j Chunk 노드 조회
+      2. Chunk -[:MENTIONS]-> Entity (직접 연결 엔티티)
+      3. Entity -[관계]-> Entity 1-hop 확장
+      4. 확장된 Entity 를 MENTIONS 하는 다른 Chunk 의 chunk_id 수집
+      5. 관계 목록 + 추가 chunk_id 반환
+
+    반환: (relations, extra_chunk_ids)
+      relations:       [{from, relation, to, evidence_chunk_id}, ...]
+      extra_chunk_ids: 확장된 chunk_id 목록 (ChromaDB 추가 조회용)
+    """
+    chunk_ids = [d["chunk_id"] for d in vector_docs if d.get("chunk_id")]
+    if not chunk_ids:
+        return [], []
+
+    driver = get_neo4j_driver()
+    relations: list[dict] = []
+    extra_chunk_ids: list[str] = []
+
+    try:
+        with driver.session() as s:
+            # Step 1~2: 해당 청크들이 언급하는 Entity 조회
+            seed_rows = s.run("""
+                MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+                WHERE c.chunk_id IN $chunk_ids
+                RETURN DISTINCT e.name AS name
+            """, {"chunk_ids": chunk_ids}).data()
+            seed_names = [r["name"] for r in seed_rows if r.get("name")]
+
+            if not seed_names:
+                return [], []
+
+            # Step 3: seed Entity 간 1-hop 관계 (의미 있는 타입만)
+            rel_rows = s.run("""
+                MATCH (a:Entity)-[r]->(b:Entity)
+                WHERE a.name IN $names
+                  AND type(r) IN $types
+                RETURN a.name AS f, type(r) AS rel, b.name AS t,
+                       r.evidence_chunk_id AS ev_chunk
+                LIMIT $limit
+            """, {
+                "names": seed_names,
+                "types": MEANINGFUL_RELATIONS,
+                "limit": max_relations * 3,
+            }).data()
+
+            seen: dict[tuple, dict] = {}
+            expanded_names = set(seed_names)
+            for row in rel_rows:
+                f, rel, t = row["f"], row["rel"], row["t"]
+                if not f or not t or f == t:
+                    continue
+                score = RELATION_TYPE_WEIGHT.get(rel, 1.0)
+                key = (f, rel, t)
+                if key not in seen or seen[key]["score"] < score:
+                    seen[key] = {
+                        "from": f, "relation": rel, "to": t,
+                        "score": score,
+                        "evidence_chunk_id": row.get("ev_chunk", ""),
+                    }
+                expanded_names.add(t)
+
+            relations = [
+                {"from": v["from"], "relation": v["relation"],
+                 "to": v["to"], "evidence_chunk_id": v.get("evidence_chunk_id", "")}
+                for v in sorted(seen.values(), key=lambda x: -x["score"])[:max_relations]
+            ]
+
+            # Step 4: 확장된 Entity 를 언급하는 다른 Chunk 의 chunk_id 수집
+            # 앵커 문서(벡터 검색 결과)와 동일한 doc_key 청크를 우선 반환 → cross-doc 노이즈 방지
+            new_names = list(expanded_names - set(seed_names))
+            if new_names:
+                anchor_doc_keys = list({
+                    d.get("doc_key", "") for d in vector_docs if d.get("doc_key")
+                })
+                extra_rows = s.run("""
+                    MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+                    WHERE e.name IN $names
+                      AND NOT c.chunk_id IN $existing_ids
+                    WITH c,
+                         CASE WHEN c.doc_key IN $anchor_doc_keys THEN 0 ELSE 1 END AS same_doc
+                    RETURN DISTINCT c.chunk_id AS chunk_id, same_doc
+                    ORDER BY same_doc ASC
+                    LIMIT $limit
+                """, {
+                    "names": new_names,
+                    "existing_ids": chunk_ids,
+                    "anchor_doc_keys": anchor_doc_keys,
+                    "limit": max_extra_chunks,
+                }).data()
+                extra_chunk_ids = [r["chunk_id"] for r in extra_rows if r.get("chunk_id")]
+
+    finally:
+        driver.close()
+
+    return relations, extra_chunk_ids
+
+
+def fetch_adjacent_chunks(vector_docs: list, window: int = 1) -> list:
+    """검색된 각 청크의 앞뒤 window개 청크를 추가 조회.
+
+    예외·조건 정보가 주 규정 청크와 인접한 청크에 위치하는 경우를 보완한다.
+    chunk_id 끝의 '::chunk{N}' 패턴으로 ±window 인덱스 ID를 생성 후 ChromaDB 조회.
+    이미 보유한 chunk_id는 건너뛰어 중복을 방지한다.
+    """
+    import re
+    pattern = re.compile(r'^(.+)::chunk(\d+)$')
+
+    existing_ids = {d.get("chunk_id") for d in vector_docs if d.get("chunk_id")}
+    adjacent_ids = []
+
+    for doc in vector_docs:
+        cid = doc.get("chunk_id", "")
+        m = pattern.match(cid)
+        if not m:
+            continue
+        prefix, idx = m.group(1), int(m.group(2))
+        for delta in range(-window, window + 1):
+            if delta == 0:
+                continue
+            new_idx = idx + delta
+            if new_idx < 0:
+                continue
+            new_id = f"{prefix}::chunk{new_idx}"
+            if new_id not in existing_ids:
+                adjacent_ids.append(new_id)
+                existing_ids.add(new_id)
+
+    return fetch_chunks_by_ids(adjacent_ids)
+
+
+def fetch_chunks_by_ids(chunk_ids: list[str]) -> list[dict]:
+    """chunk_id 목록으로 ChromaDB 에서 청크 텍스트를 직접 조회."""
+    if not chunk_ids:
+        return []
+    try:
+        client = get_chroma_client()
+        collection = client.get_collection(COLLECTION_NAME)
+        results = collection.get(ids=chunk_ids, include=["documents", "metadatas"])
+        docs = []
+        for cid, doc, meta in zip(
+            results.get("ids", []),
+            results.get("documents", []),
+            results.get("metadatas", []),
+        ):
+            if doc:
+                docs.append({
+                    "content":  doc,
+                    "source":   (meta or {}).get("file_name", ""),
+                    "score":    None,
+                    "chunk_id": cid,
+                    "doc_key":  (meta or {}).get("doc_key", ""),
+                })
+        return docs
+    except Exception as e:
+        print(f"[fetch_chunks_by_ids 오류] {e}")
+        return []
 
 
 def vector_anchored_graph_search(
@@ -913,12 +1106,11 @@ REL_KO = {
 # 검색된 본문 chunk 에 substring 으로 등장하는지 검증. 한쪽도 안 나오면 drop.
 # HAS_THRESHOLD/EXCLUDES_FROM/EXCLUDES/HAS_EXCEPTION 같은 임계값/예외 관계는
 # 더 엄격하게 양쪽 모두 등장 요구.
-USE_GRAPH_GATING = os.getenv("USE_GRAPH_GATING", "0") == "1"  # Phase 5 결과
-# inconclusive (V 에 29 pipeline error 섞임, H=42 신뢰 불가) → 일단 OFF.
-# 향후 retest 가능 — 코드는 보존.
+USE_GRAPH_GATING = os.getenv("USE_GRAPH_GATING", "1") == "1"  # 본문과 무관한 triple 제거
 STRICT_GATING_RELS = {
     "HAS_THRESHOLD", "EXCLUDES", "EXCLUDES_FROM", "HAS_EXCEPTION",
-    "SUBSTITUTES_FOR",  # 대체 관계도 잘못 적용되면 핵심 오답 유발
+    "SUBSTITUTES_FOR",
+    "HAS_CONDITION",   # 조건 관계도 양쪽 모두 본문에 있어야 신뢰
 }
 
 
@@ -1040,7 +1232,7 @@ def merge_results(vector_docs, graph_data):
 
 # ── LLM 답변 생성 ─────────────────────────────────────────
 GENERATION_MODEL = "solar-pro3"  # 단일 source of truth — 호출부에서 이 상수 참조
-GENERATION_TEMPERATURE = 0.2     # 논문 기록용 (낮은 값으로 결정성/재현성 우선)
+GENERATION_TEMPERATURE = 0       # 재현성 확보 및 RAG hallucination 억제
 GENERATION_MAX_TOKENS = None     # None=모델 기본값. Phase 2 ablation 결과 cap=400 이
                                  # vector(-5) hybrid(-6) 모두 떨어뜨림 → 무제한 복귀.
 
@@ -1113,13 +1305,21 @@ def generate_answer(query, context, model=GENERATION_MODEL):
     prompt = f"""당신은 경북대학교 컴퓨터학부 학생들을 위한 AI 챗봇입니다.
 
 아래 검색 결과를 바탕으로 질문에 답변하세요. 검색 결과는 두 가지로 구성됩니다:
-- [핵심 관계/조건 단서]: 지식 그래프에서 추출한 개체 간 관계 — 본문 검증/보강 *보조 자료*. 본문에 같은 정보가 있으면 본문 표현 사용. 본문에 없거나 불충분한 부분만 단서로 보강.
+- [핵심 관계/조건 단서]: 지식 그래프에서 추출한 개체 간 관계 — 본문 검증/보강 *보조 자료*.
 - [문서 본문]: 공지/문서의 실제 서술. **답변의 1차 근거** — 사실, 수치, 자격, 조건, 예외, 면제 모두 본문 우선.
 
 답변 규칙:
-1. **본문 우선** — 단서와 본문이 충돌하면 본문 채택. 단서만 있고 본문에 없으면 단서로 답하기 전 정말 질문과 일치하는지 다시 확인.
+1. **본문 우선** — 단서와 본문이 충돌하면 본문 채택. 단서만 있고 본문에 없으면 단서로 답하기 전 질문과 일치하는지 다시 확인.
 2. 검색 결과에 없는 내용은 추측 금지 — "해당 정보를 찾을 수 없습니다." 답변.
 3. 본문에 "면제", "예외", "단", "다만" 같은 한정/예외 조항이 있으면 절대 누락 금지.
+4. **트랙 구분 (중요)**: 본문에 [다중전공트랙], [해외복수학위트랙], [학석사연계트랙] 같은 태그가 붙은 항목은 해당 트랙에만 적용되는 요건임. 질문이 특정 트랙을 묻는다면 *그 트랙 태그가 붙은 수치·조건만* 사용하고 다른 트랙의 값은 절대 혼용 금지.
+5. 같은 항목(영어성적, 해외학점, 창업교과목 등)이 트랙마다 다른 값으로 나오면 질문에서 묻는 트랙의 값만 답변.
+6. **유효기간·대상 제한 필수 확인**: 본문에 '~이내', '~에 한함', '~은 제외', '편입생', '외국인', '특정 학번 이후', '~이후 창업' 등 대상·기간 제한 표현이 있으면 질문 상황과 대조하여 반드시 답변에 포함. 유효기간·자격 제한·추가 이수 조건은 절대 생략 금지.
+
+답변 형식 (반드시 준수):
+- **첫 문장(또는 첫 단락)에 결론을 직접 답하세요** — 핵심 사실·수치·가부를 먼저 명확히 제시.
+- 결론 이후에 근거, 조건, 출처, 분석 내용을 자유롭게 상세히 서술해도 됩니다.
+- 결론이 맨 마지막에 오는 구성은 금지.
 
 [검색 결과]
 {context}
@@ -1214,22 +1414,38 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
     if use_graph and GRAPH_USAGE != "off":
         try:
             if GRAPH_USAGE == "anchored":
-                # Phase 13: graph anchor 용 vector_docs 분리 옵션
-                # USE_RERANK=0 (vector raw) + RERANK_FOR_GRAPH_ANCHOR=1 →
-                # graph 시작점은 rerank 거친 chunks 사용 (topically cleaner)
+                # chunk_id 브리지 기반 그래프 검색 (Document/Chunk/Entity 3계층)
+                # 흐름: chunk_id → Neo4j Chunk → MENTIONS → Entity →
+                #        1-hop 관계 확장 → 관련 Entity → 추가 Chunk → ChromaDB 재조회
+                anchor_docs = vector_docs
                 if (not USE_RERANK) and RERANK_FOR_GRAPH_ANCHOR and vector_docs:
                     try:
-                        # 다시 top-10 가져와서 rerank → top-5 (graph anchor 전용)
                         anchor_candidates = _raw_vector_search(query, n_results=RETRIEVE_K)
                         anchor_docs = llm_rerank(query, anchor_candidates, top_k=RERANK_TO_K)
                     except Exception:
                         anchor_docs = vector_docs
-                else:
-                    anchor_docs = vector_docs
-                # Phase 10b: max_relations 5→3 (graph 신호 더 압축)
-                graph_relations = vector_anchored_graph_search(
-                    query, anchor_docs, max_relations=3,
+
+                graph_relations, extra_chunk_ids = chunk_anchored_graph_search(
+                    anchor_docs, max_relations=3, max_extra_chunks=3,
                 )
+                # 확장된 chunk_id 로 ChromaDB 추가 조회 후 vector_docs 에 병합
+                if extra_chunk_ids:
+                    extra_docs = fetch_chunks_by_ids(extra_chunk_ids)
+                    seen_ids = {d["chunk_id"] for d in vector_docs if d.get("chunk_id")}
+                    added = 0
+                    for d in extra_docs:
+                        if d.get("chunk_id") not in seen_ids:
+                            vector_docs.append(d)
+                            seen_ids.add(d["chunk_id"])
+                            added += 1
+                    if verbose and added:
+                        print(f"\n[Graph 확장] 추가 청크 {added}개 병합")
+                    # 그래프 확장 청크 포함 전체를 다시 rerank — 무관 문서 제거
+                    if USE_RERANK and added > 0:
+                        combined_k = min(RERANK_TO_K + 2, len(vector_docs))
+                        vector_docs = llm_rerank(query, vector_docs, top_k=combined_k)
+                        if verbose:
+                            print(f"[확장 후 Rerank] 최종 {len(vector_docs)}개")
                 graph_data = graph_relations
             elif USE_GRAPH_SEARCH_V3:
                 graph_data = graph_search_v3(query, vector_docs=vector_docs)
@@ -1274,6 +1490,21 @@ def hybrid_rag(query, use_vector=True, use_graph=True, verbose=True):
             except Exception as e:
                 if verbose:
                     print(f"\n[Graph expansion 오류] {e}")
+
+    # 인접 청크 확장 — 예외·조건이 이웃 청크에 분리된 경우를 보완
+    # rerank 이후에 추가하므로 노이즈 필터링을 거친 최종 청크 기준으로 확장됨
+    if USE_ADJACENT_EXPANSION and vector_docs:
+        adj_docs = fetch_adjacent_chunks(vector_docs, window=1)
+        if adj_docs:
+            seen_ids = {d.get("chunk_id") for d in vector_docs if d.get("chunk_id")}
+            added = 0
+            for d in adj_docs:
+                if d.get("chunk_id") not in seen_ids:
+                    vector_docs.append(d)
+                    seen_ids.add(d["chunk_id"])
+                    added += 1
+            if verbose and added:
+                print(f"\n[인접 청크 확장] {added}개 추가")
 
     if verbose:
         print(f"\n[Vector 검색] {len(vector_docs)}개 문서")
@@ -1332,4 +1563,67 @@ def vector_only_rag(query, verbose=True):
         "context": context,
         "answer": answer
     }
+
+
+if __name__ == "__main__":
+    import sys
+
+    print("=" * 62)
+    print("  KNU CS HybridRAG 챗봇")
+    print("=" * 62)
+
+    # ── Neo4j 연결 확인 ──────────────────────────────────────
+    print(f"\n Neo4j 연결 확인 중 ({NEO4J_URI}) ...", end=" ", flush=True)
+    neo4j_ok, neo4j_err = check_neo4j_connection()
+
+    if neo4j_ok:
+        print("✓ 연결 성공\n")
+        _use_graph = True
+    else:
+        print("✗ 연결 실패\n")
+        print("=" * 62)
+        print("  [경고] Neo4j에 연결할 수 없습니다.")
+        print(f"  오류: {neo4j_err}")
+        print()
+        print("  Neo4j 없이 계속하면 그래프 검색이 비활성화되어")
+        print("  Vector 검색만 사용됩니다. 답변 품질이 저하될 수 있습니다.")
+        print()
+        print("  Docker가 실행 중인지 확인하려면:")
+        print("    docker compose up -d")
+        print("=" * 62)
+
+        while True:
+            ans = input("\n  계속 진행하시겠습니까? (Vector 검색만 사용) [y/n] > ").strip().lower()
+            if ans == "y":
+                _use_graph = False
+                print("  → Vector 검색 전용 모드로 실행합니다.\n")
+                break
+            elif ans == "n":
+                print("  종료합니다.")
+                sys.exit(0)
+            else:
+                print("  y 또는 n 을 입력하세요.")
+
+    # ── 대화형 질의응답 루프 ──────────────────────────────────
+    mode_label = "Hybrid RAG" if _use_graph else "Vector Only"
+    print(f"[{mode_label}] 질문을 입력하세요. 종료: q")
+    print("-" * 62)
+
+    while True:
+        try:
+            query = input("\n질문 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n종료합니다.")
+            break
+
+        if not query:
+            continue
+        if query.lower() in ("q", "quit", "exit", "종료"):
+            print("종료합니다.")
+            break
+
+        if _use_graph:
+            hybrid_rag(query, verbose=True, use_graph=True)
+        else:
+            vector_only_rag(query, verbose=True)
 

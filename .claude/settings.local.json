@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(python -c \":*)",
+      "Bash(python *)",
+      "Bash(pip show *)",
+      "Bash(Select-String \"Name|Version\")",
+      "Bash(pip install *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "PowerShell(python -c $script)",
+      "PowerShell($script = 'import sys; src = open\\(\\\\\"pipeline/03_graph_db.py\\\\\", encoding=\\\\\"utf-8\\\\\"\\).read\\(\\); print\\(repr\\(src[src.find\\(\\\\\"properties\\\\\"\\):src.find\\(\\\\\"properties\\\\\"\\)+80]\\)\\)')",
+      "Bash(del *)"
+    ]
+  }
+}
