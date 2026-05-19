@@ -21,10 +21,11 @@ export function ChatInput() {
   const { isStreaming } = useChatStore()
   const { sendMessage, abortStream } = useSendMessage()
 
-  const { register, handleSubmit, watch, reset, setValue } = useForm<FormValues>({
+  const { register, handleSubmit, watch, reset } = useForm<FormValues>({
     defaultValues: { message: '' },
   })
 
+  // eslint-disable-next-line react-hooks/incompatible-library
   const messageValue = watch('message')
   const isEmpty = !messageValue.trim()
 
